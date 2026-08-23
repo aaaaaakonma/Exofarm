@@ -1,0 +1,32 @@
+# Godot 4+ specific ignores
+.godot/
+/android/
+
+# SCons / C++ compilation artifacts
+*.obj
+*.os
+*.o
+*.pdb
+*.exp
+*.lib
+*.ilk
+*.dblite
+.sconsign*
+.sconf_temp/
+config.log
+
+# Executables & dynamic libraries (built locally)
+*.exe
+bin/*.dll
+bin/*.so
+bin/*.dylib
+bin/*.exp
+bin/*.lib
+bin/*.pdb
+
+# Temp / backup files
+~*
+*.tmp
+*.bak
+*.import
+

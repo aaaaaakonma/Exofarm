@@ -1,0 +1,11 @@
+[configuration]
+entry_symbol = "mecha_arpg_library_init"
+compatibility_minimum = "4.1"
+
+[libraries]
+windows.debug.x86_64 = "res://bin/libmecha_arpg.windows.template_debug.x86_64.dll"
+windows.release.x86_64 = "res://bin/libmecha_arpg.windows.template_release.x86_64.dll"
+linux.debug.x86_64 = "res://bin/libmecha_arpg.linux.template_debug.x86_64.so"
+linux.release.x86_64 = "res://bin/libmecha_arpg.linux.template_release.x86_64.so"
+macos.debug = "res://bin/libmecha_arpg.macos.template_debug.framework"
+macos.release = "res://bin/libmecha_arpg.macos.template_release.framework"

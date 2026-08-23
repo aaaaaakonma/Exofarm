@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://cax2m4k7y1p8n"]
+
+[ext_resource type="Script" path="res://river_micro_visualizer.gd" id="1_rvscript"]
+
+[node name="GroundMapVisualizer" type="Node2D"]
+script = ExtResource("1_rvscript")
