@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://c8b74x1w1ay2d"]
+
+[ext_resource type="Script" path="res://world_3d_visualizer.gd" id="1_world3d"]
+
+[node name="World3DVisualizer" type="Node3D"]
+script = ExtResource("1_world3d")

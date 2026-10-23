@@ -15,12 +15,7 @@
 // For simplicity in this standalone tool, we include the implementations.
 #include "src/core/world.cpp"
 #include "src/core/item.cpp"
-#include "src/core/collision.cpp"
-#include "src/math/cordic.cpp"
-#include "src/core/map_generator.cpp"
 #include "src/entities/player.cpp"
-#include "src/entities/enemy.cpp"
-#include "src/entities/wall.cpp"
 
 template<typename T>
 bool compare_vec(const std::string& name, const std::vector<T>& a, const std::vector<T>& b, const std::vector<EntityID>& ids) {
@@ -41,20 +36,12 @@ bool compare_vec(const std::string& name, const std::vector<T>& a, const std::ve
     return true;
 }
 
-void compare_grids(const EntityGrid& expected, const EntityGrid& actual) {
-    if (expected.get_width() != actual.get_width() || expected.get_height() != actual.get_height()) {
-        std::cout << "  [DIVERGENCE] Grid size mismatch: " << expected.get_width() << "x" << expected.get_height() << " vs " << actual.get_width() << "x" << actual.get_height() << std::endl;
-    }
-}
-
 void compare_snapshots(const SimWorld& expected_world, const SimWorld& actual_world) {
     const BisectSnapshot expected = expected_world.snapshot();
     const BisectSnapshot actual = actual_world.snapshot();
 
     std::cout << "\n--- Deep State Divergence Analysis ---" << std::endl;
     std::cout << "Expected Tick: " << expected.tick << " | Actual Tick: " << actual.tick << std::endl;
-    
-    compare_grids(expected_world.get_grid(), actual_world.get_grid());
     
     if (expected.tick != actual.tick) std::cout << "  [DIVERGENCE] Tick mismatch: " << expected.tick << " vs " << actual.tick << std::endl;
     if (expected.next_id != actual.next_id) std::cout << "  [DIVERGENCE] next_id mismatch: " << expected.next_id << " vs " << actual.next_id << std::endl;
@@ -253,7 +240,6 @@ void run_test(uint64_t seed) {
         input.payload.player.move_y = rng.next_range(-65536, 65536);
         input.payload.player.aim_x = (int64_t)rng.next_range(-1000, 1000) << 16;
         input.payload.player.aim_y = (int64_t)rng.next_range(-1000, 1000) << 16;
-        input.payload.player.actions = (rng.next() % 10 == 0) ? ACTION_ATTACK : ACTION_NONE;
         input.tick = world_gen.current_tick();
 
         world_gen.tick(input);

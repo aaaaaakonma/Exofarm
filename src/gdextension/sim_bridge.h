@@ -22,6 +22,9 @@ public:
     static void _bind_methods();
 
     void              set_seed(int64_t seed);
+    void              set_config(const godot::Dictionary &params);
+    void              set_params(const godot::Dictionary &params);
+    godot::Dictionary get_config() const;
     void              set_tectonic_config(int64_t plates_min, int64_t plates_max, int64_t center_bias, int64_t continent_chance, int64_t vel_min = 50, int64_t vel_max = 300);
 
     // Called every physics tick from GDScript with the current InputFrame
@@ -126,6 +129,13 @@ public:
     int64_t                get_weather_state() const;
     int64_t                get_weather_timer() const;
     int64_t                get_co2_level() const;
+
+    // Tectonic Heightmap & Wave Cage APIs
+    godot::Dictionary            get_tectonic_sample(double x, double y) const;
+    godot::TypedArray<godot::Dictionary> get_tectonic_nodes() const;
+    godot::TypedArray<godot::Dictionary> get_macro_edges() const;
+    godot::TypedArray<godot::Dictionary> get_macro_plates() const;
+    godot::PackedFloat32Array    get_wave_cage_data(double sea_level = 0.0) const;
 
 private:
     static SimBridge *singleton;

@@ -1,9 +1,23 @@
 #pragma once
 #include "fixed.h"
-#include "shapes.h"
 #include "hydrology_graph.h"
 #include <vector>
 #include <cstdint>
+
+namespace Generation {
+enum class SurfaceType : uint8_t {
+    DRY_SOIL        = 0,
+    TILLED_SOIL     = 1,
+    MUD_BANK        = 2,
+    WATER_SHALLOW   = 3, // Wadeable, movement speed reduced
+    WATER_DEEP      = 4, // Impassable wall, requires bridge
+    ROCK_CLIFF      = 5, // Impassable cliff wall
+    MINERAL_N       = 6, // Nitrogen deposit
+    MINERAL_P       = 7, // Phosphorus deposit
+    MINERAL_K       = 8, // Potassium deposit
+};
+using MicroSurfaceType = SurfaceType;
+}
 
 typedef uint32_t EntityID;
 constexpr EntityID INVALID_ENTITY = 0;
@@ -264,8 +278,8 @@ struct BisectSnapshot {
     std::vector<EntityID> entity_recycle_bin; // Non-projectile IDs available for reuse
     std::vector<EntityID> attack_recycle_bin;
     std::vector<uint64_t> hit_pairs;        // Collision history
-    std::vector<SimAABB>  walls;            // Static environment
-    std::vector<SimPolygon> polygons;
+
+
 
     // Map state for farming game
     int32_t               map_width = 0;

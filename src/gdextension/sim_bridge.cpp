@@ -9,6 +9,9 @@ SimBridge *SimBridge::singleton = nullptr;
 void SimBridge::_bind_methods() {
     ClassDB::bind_method(D_METHOD("load_tile_registry", "path"), &SimBridge::load_tile_registry);
     ClassDB::bind_method(D_METHOD("set_seed", "seed"), &SimBridge::set_seed);
+    ClassDB::bind_method(D_METHOD("set_config", "params"), &SimBridge::set_config);
+    ClassDB::bind_method(D_METHOD("set_params", "params"), &SimBridge::set_params);
+    ClassDB::bind_method(D_METHOD("get_config"), &SimBridge::get_config);
     ClassDB::bind_method(D_METHOD("set_tectonic_config", "plates_min", "plates_max", "center_bias", "continent_chance", "vel_min", "vel_max"), &SimBridge::set_tectonic_config, DEFVAL(50), DEFVAL(300));
     ClassDB::bind_method(D_METHOD("step", "move_x", "move_y", "aim_x", "aim_y", "actions"), &SimBridge::step);
     ClassDB::bind_method(D_METHOD("spawn_entity", "type", "x", "y", "radius", "health", "tags"), &SimBridge::spawn_entity, DEFVAL(0));
@@ -93,7 +96,14 @@ void SimBridge::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_weather_state"), &SimBridge::get_weather_state);
     ClassDB::bind_method(D_METHOD("get_weather_timer"), &SimBridge::get_weather_timer);
     ClassDB::bind_method(D_METHOD("get_co2_level"), &SimBridge::get_co2_level);
+
+    ClassDB::bind_method(D_METHOD("get_tectonic_sample", "x", "y"), &SimBridge::get_tectonic_sample);
+    ClassDB::bind_method(D_METHOD("get_tectonic_nodes"), &SimBridge::get_tectonic_nodes);
+    ClassDB::bind_method(D_METHOD("get_macro_edges"), &SimBridge::get_macro_edges);
+    ClassDB::bind_method(D_METHOD("get_macro_plates"), &SimBridge::get_macro_plates);
+    ClassDB::bind_method(D_METHOD("get_wave_cage_data", "sea_level"), &SimBridge::get_wave_cage_data, DEFVAL(0.0));
 }
+
 
 SimBridge::SimBridge() {
     singleton = this;
@@ -113,13 +123,78 @@ void SimBridge::set_seed(int64_t seed) {
     _world.set_seed((uint64_t)seed);
 }
 
+void SimBridge::set_config(const godot::Dictionary &params) {
+    auto& cfg = _world.get_tectonic_config_mut();
+
+    if (params.has("seed")) {
+        int64_t s = params["seed"];
+        set_seed(s);
+    }
+    if (params.has("num_plates")) cfg.num_plates = (int32_t)(int64_t)params["num_plates"];
+    if (params.has("num_fine_plates")) cfg.num_fine_plates = (int32_t)(int64_t)params["num_fine_plates"];
+    if (params.has("continent_chance")) {
+        double c = params["continent_chance"];
+        cfg.continent_chance_pct = (c <= 1.0) ? (int32_t)(c * 100.0) : (int32_t)c;
+    }
+    if (params.has("island_arc_chance")) {
+        double c = params["island_arc_chance"];
+        cfg.island_arc_chance_pct = (c <= 1.0) ? (int32_t)(c * 100.0) : (int32_t)c;
+    }
+    if (params.has("warp_scale")) cfg.warp_scale = (int64_t)((double)params["warp_scale"] * 65536.0);
+    if (params.has("warp_frequency")) cfg.warp_frequency = (int64_t)params["warp_frequency"];
+    if (params.has("collision_uplift")) cfg.collision_uplift_scale = (int64_t)((double)params["collision_uplift"] * 65536.0);
+    if (params.has("subduction_arc")) cfg.subduction_arc_scale = (int64_t)((double)params["subduction_arc"] * 65536.0);
+    if (params.has("subduction_trench")) cfg.subduction_trench_scale = (int64_t)((double)params["subduction_trench"] * 65536.0);
+    if (params.has("fold_belt_width")) cfg.fold_belt_base_width = (int64_t)((double)params["fold_belt_width"] * 65536.0);
+    if (params.has("rift_graben")) cfg.rift_graben_scale = (int64_t)((double)params["rift_graben"] * 65536.0);
+    if (params.has("rift_shoulder")) cfg.rift_shoulder_scale = (int64_t)((double)params["rift_shoulder"] * 65536.0);
+    if (params.has("continental_base_elevation")) cfg.continental_base_elevation = (int64_t)((double)params["continental_base_elevation"] * 65536.0);
+    if (params.has("oceanic_base_elevation")) cfg.oceanic_base_elevation = (int64_t)((double)params["oceanic_base_elevation"] * 65536.0);
+    if (params.has("island_arc_base_elevation")) cfg.island_arc_base_elevation = (int64_t)((double)params["island_arc_base_elevation"] * 65536.0);
+    if (params.has("coastal_boundary_elevation")) cfg.coastal_boundary_elevation = (int64_t)((double)params["coastal_boundary_elevation"] * 65536.0);
+    if (params.has("shelf_width")) cfg.shelf_width = (int64_t)((double)params["shelf_width"] * 65536.0);
+    if (params.has("shelf_depth")) cfg.shelf_depth = (int64_t)((double)params["shelf_depth"] * 65536.0);
+    if (params.has("detail_noise_scale")) cfg.detail_noise_scale = (int64_t)((double)params["detail_noise_scale"] * 65536.0);
+    if (params.has("noise_octaves")) cfg.noise_octaves = (int)(int64_t)params["noise_octaves"];
+}
+
+void SimBridge::set_params(const godot::Dictionary &params) {
+    set_config(params);
+}
+
+godot::Dictionary SimBridge::get_config() const {
+    godot::Dictionary dict;
+    const auto& cfg = _world.get_tectonic_config();
+
+    dict["seed"] = (int64_t)cfg.seed;
+    dict["num_plates"] = (int64_t)cfg.num_plates;
+    dict["num_fine_plates"] = (int64_t)cfg.num_fine_plates;
+    dict["continent_chance"] = (double)cfg.continent_chance_pct;
+    dict["island_arc_chance"] = (double)cfg.island_arc_chance_pct;
+    dict["warp_scale"] = (double)cfg.warp_scale / 65536.0;
+    dict["warp_frequency"] = (int64_t)cfg.warp_frequency;
+    dict["collision_uplift"] = (double)cfg.collision_uplift_scale / 65536.0;
+    dict["subduction_arc"] = (double)cfg.subduction_arc_scale / 65536.0;
+    dict["subduction_trench"] = (double)cfg.subduction_trench_scale / 65536.0;
+    dict["fold_belt_width"] = (double)cfg.fold_belt_base_width / 65536.0;
+    dict["rift_graben"] = (double)cfg.rift_graben_scale / 65536.0;
+    dict["rift_shoulder"] = (double)cfg.rift_shoulder_scale / 65536.0;
+    dict["continental_base_elevation"] = (double)cfg.continental_base_elevation / 65536.0;
+    dict["oceanic_base_elevation"] = (double)cfg.oceanic_base_elevation / 65536.0;
+    dict["island_arc_base_elevation"] = (double)cfg.island_arc_base_elevation / 65536.0;
+    dict["coastal_boundary_elevation"] = (double)cfg.coastal_boundary_elevation / 65536.0;
+    dict["shelf_width"] = (double)cfg.shelf_width / 65536.0;
+    dict["shelf_depth"] = (double)cfg.shelf_depth / 65536.0;
+    dict["detail_noise_scale"] = (double)cfg.detail_noise_scale / 65536.0;
+    dict["noise_octaves"] = (int64_t)cfg.noise_octaves;
+
+    return dict;
+}
+
 void SimBridge::set_tectonic_config(int64_t plates_min, int64_t plates_max, int64_t center_bias, int64_t continent_chance, int64_t vel_min, int64_t vel_max) {
-    Generation::TectonicWorld::config_num_plates_min = (int32_t)plates_min;
-    Generation::TectonicWorld::config_num_plates_max = (int32_t)plates_max;
-    Generation::TectonicWorld::config_center_bias = (int32_t)center_bias;
-    Generation::TectonicWorld::config_continent_chance = (int32_t)continent_chance;
-    Generation::TectonicWorld::config_vel_min = (int32_t)vel_min;
-    Generation::TectonicWorld::config_vel_max = (int32_t)vel_max;
+    auto& cfg = _world.get_tectonic_config_mut();
+    cfg.num_plates = (int32_t)plates_max;
+    cfg.continent_chance_pct = (int32_t)continent_chance;
 }
 
 bool SimBridge::load_tile_registry(godot::String path) {
@@ -160,35 +235,16 @@ void SimBridge::unequip_item(int64_t entity_id, int64_t slot) {
 }
 
 void SimBridge::add_wall(int64_t x, int64_t y, int64_t w, int64_t h) {
-    _world.add_wall(x, y, w, h);
 }
 
 void SimBridge::add_polygon(int64_t x, int64_t y, godot::PackedInt64Array vx, godot::PackedInt64Array vy) {
-    std::vector<int64_t> vec_x(vx.size());
-    std::vector<int64_t> vec_y(vy.size());
-    for (int i = 0; i < vx.size(); ++i) vec_x[i] = vx[i];
-    for (int i = 0; i < vy.size(); ++i) vec_y[i] = vy[i];
-    _world.add_polygon(x, y, vec_x, vec_y);
 }
 
 void SimBridge::clear_polygons() {
-    _world.clear_polygons();
 }
 
 godot::TypedArray<godot::Dictionary> SimBridge::get_polygons() const {
-    godot::TypedArray<godot::Dictionary> arr;
-    for (const auto &p : _world.get_polygons()) {
-        godot::Dictionary dict;
-        dict["x"] = (int64_t)p.x;
-        dict["y"] = (int64_t)p.y;
-        godot::PackedInt64Array vx, vy;
-        vx.resize(p.vx.size()); vy.resize(p.vy.size());
-        for (size_t i = 0; i < p.vx.size(); ++i) { vx[i] = p.vx[i]; vy[i] = p.vy[i]; }
-        dict["vx"] = vx;
-        dict["vy"] = vy;
-        arr.push_back(dict);
-    }
-    return arr;
+    return godot::TypedArray<godot::Dictionary>();
 }
 
 int64_t SimBridge::get_map_width() const {
@@ -331,13 +387,9 @@ godot::Dictionary SimBridge::get_room_type_info() const {
 }
 
 void SimBridge::generate_map_cellular_automata(int64_t seed, int64_t width, int64_t height, int64_t cell_size_fixed, int64_t iterations, int64_t fill_prob) {
-    _world.generate_map_cellular_automata((uint64_t)seed, width, height, cell_size_fixed, (int32_t)iterations, (int32_t)fill_prob);
 }
 
-
-
 void SimBridge::clear_walls() {
-    _world.clear_walls();
 }
 
 TypedArray<int64_t> SimBridge::get_entity_state(int64_t id) const {
@@ -360,16 +412,7 @@ TypedArray<int64_t> SimBridge::get_entity_state(int64_t id) const {
 }
 
 godot::TypedArray<godot::Dictionary> SimBridge::get_walls() const {
-    godot::TypedArray<godot::Dictionary> arr;
-    for (const auto &w : _world.get_walls()) {
-        godot::Dictionary dict;
-        dict["x"] = (int64_t)w.x;
-        dict["y"] = (int64_t)w.y;
-        dict["width"] = (int64_t)w.width;
-        dict["height"] = (int64_t)w.height;
-        arr.push_back(dict);
-    }
-    return arr;
+    return godot::TypedArray<godot::Dictionary>();
 }
 
 godot::Dictionary SimBridge::get_active_entities() const {
@@ -445,15 +488,15 @@ void SimBridge::restore_snapshot(godot::PackedByteArray data) {
 
 godot::Dictionary SimBridge::get_spatial_info() const {
     godot::Dictionary dict;
-    dict["min_cx"] = (int64_t)_world.get_grid().get_min_cx();
-    dict["min_cy"] = (int64_t)_world.get_grid().get_min_cy();
-    dict["width"] = (int64_t)_world.get_grid().get_width();
-    dict["height"] = (int64_t)_world.get_grid().get_height();
+    dict["min_cx"] = (int64_t)0;
+    dict["min_cy"] = (int64_t)0;
+    dict["width"] = (int64_t)_world.get_map_width();
+    dict["height"] = (int64_t)_world.get_map_height();
     return dict;
 }
 
 int64_t SimBridge::get_cell_occupancy(int64_t x, int64_t y) const {
-    return _world.get_grid().get_cell_occupancy(x, y);
+    return 0;
 }
 
 void SimBridge::plant_crop(int64_t x, int64_t y, int64_t crop_type, int64_t prefix, int64_t suffix, int64_t implicit) {
@@ -779,4 +822,160 @@ godot::Dictionary SimBridge::get_river_pipe_info(int64_t index) const {
         dict["is_dry"] = b.is_dry;
     }
     return dict;
+}
+
+godot::Dictionary SimBridge::get_tectonic_sample(double x, double y) const {
+    godot::Dictionary dict;
+    int64_t xf = static_cast<int64_t>(x * 65536.0);
+    int64_t yf = static_cast<int64_t>(y * 65536.0);
+    const auto& tmap = _world.get_tectonic_heightmap();
+    Tectonics::TectonicSample sample = tmap.sample(xf, yf);
+
+    dict["elevation"] = sample.final_elevation_float();
+    dict["elevation_base"] = sample.base_elevation_float();
+    dict["elevation_tectonic"] = sample.tectonic_elevation_float();
+    dict["elevation_noise"] = static_cast<double>(sample.elevation_noise) / 65536.0;
+    dict["primary_plate_id"] = static_cast<int64_t>(sample.primary_plate_id);
+    dict["secondary_plate_id"] = static_cast<int64_t>(sample.secondary_plate_id);
+    dict["dist_to_boundary"] = static_cast<double>(sample.dist_to_boundary) / 65536.0;
+    dict["convergence_rate"] = static_cast<double>(sample.convergence_rate) / 65536.0;
+    dict["shear_rate"] = static_cast<double>(sample.shear_rate) / 65536.0;
+    dict["boundary_type"] = static_cast<int64_t>(sample.boundary_type);
+    return dict;
+}
+
+godot::TypedArray<godot::Dictionary> SimBridge::get_tectonic_nodes() const {
+    godot::TypedArray<godot::Dictionary> arr;
+    const auto& nodes = _world.get_tectonic_heightmap().get_nodes();
+    for (const auto& node : nodes) {
+        godot::Dictionary d;
+        d["id"] = static_cast<int64_t>(node.id);
+        d["plate_id"] = static_cast<int64_t>(node.get_plate_id());
+        d["pos_x"] = static_cast<double>(node.position.x) / 65536.0;
+        d["pos_y"] = static_cast<double>(node.position.y) / 65536.0;
+        d["vel_x"] = static_cast<double>(node.velocity.x) / 65536.0;
+        d["vel_y"] = static_cast<double>(node.velocity.y) / 65536.0;
+        d["angular_velocity"] = static_cast<double>(node.angular_velocity) / 65536.0;
+        d["tilt_x"] = static_cast<double>(node.tilt_vector.x) / 65536.0;
+        d["tilt_y"] = static_cast<double>(node.tilt_vector.y) / 65536.0;
+        d["plate_type"] = static_cast<int64_t>(node.plate_type);
+        d["base_elevation"] = static_cast<double>(node.base_elevation) / 65536.0;
+        d["crust_thickness"] = static_cast<double>(node.crust_thickness) / 65536.0;
+        d["crust_rigidity"] = static_cast<double>(node.crust_rigidity) / 65536.0;
+        arr.push_back(d);
+    }
+    return arr;
+}
+
+godot::TypedArray<godot::Dictionary> SimBridge::get_macro_edges() const {
+    godot::TypedArray<godot::Dictionary> arr;
+    const auto& edges = _world.get_tectonic_heightmap().get_macro_edges();
+    for (const auto& e : edges) {
+        godot::Dictionary d;
+        d["id"] = static_cast<int64_t>(e.id);
+        d["plate_a"] = static_cast<int64_t>(e.plate_a);
+        d["plate_b"] = static_cast<int64_t>(e.plate_b);
+        d["plate_id_a"] = static_cast<int64_t>(e.plate_id_a);
+        d["plate_id_b"] = static_cast<int64_t>(e.plate_id_b);
+        d["plate_type_a"] = static_cast<int64_t>(e.plate_type_a);
+        d["plate_type_b"] = static_cast<int64_t>(e.plate_type_b);
+        d["v0_x"] = static_cast<double>(e.v0.x) / 65536.0;
+        d["v0_y"] = static_cast<double>(e.v0.y) / 65536.0;
+        d["v1_x"] = static_cast<double>(e.v1.x) / 65536.0;
+        d["v1_y"] = static_cast<double>(e.v1.y) / 65536.0;
+        d["length"] = static_cast<double>(e.length) / 65536.0;
+        d["normal_x"] = static_cast<double>(e.normal.x) / 65536.0;
+        d["normal_y"] = static_cast<double>(e.normal.y) / 65536.0;
+        d["tangent_x"] = static_cast<double>(e.tangent.x) / 65536.0;
+        d["tangent_y"] = static_cast<double>(e.tangent.y) / 65536.0;
+        d["convergence_rate"] = static_cast<double>(e.convergence_rate) / 65536.0;
+        d["shear_rate"] = static_cast<double>(e.shear_rate) / 65536.0;
+        d["impact_force"] = static_cast<double>(e.impact_force) / 65536.0;
+        d["boundary_type"] = static_cast<int64_t>(e.boundary_type);
+        d["alpha"] = static_cast<double>(e.alpha) / 65536.0;
+        d["peak_uplift"] = static_cast<double>(e.peak_uplift) / 65536.0;
+        d["a_overrides"] = e.a_overrides;
+        arr.push_back(d);
+    }
+    return arr;
+}
+
+godot::TypedArray<godot::Dictionary> SimBridge::get_macro_plates() const {
+    godot::TypedArray<godot::Dictionary> arr;
+    const auto& plates = _world.get_tectonic_heightmap().get_macro_plates();
+    for (const auto& plate : plates) {
+        godot::Dictionary d;
+        d["id"] = static_cast<int64_t>(plate.id);
+        d["plate_id"] = static_cast<int64_t>(plate.get_plate_id());
+        d["pos_x"] = static_cast<double>(plate.position.x) / 65536.0;
+        d["pos_y"] = static_cast<double>(plate.position.y) / 65536.0;
+        d["vel_x"] = static_cast<double>(plate.velocity.x) / 65536.0;
+        d["vel_y"] = static_cast<double>(plate.velocity.y) / 65536.0;
+        d["angular_velocity"] = static_cast<double>(plate.angular_velocity) / 65536.0;
+        d["tilt_x"] = static_cast<double>(plate.tilt_vector.x) / 65536.0;
+        d["tilt_y"] = static_cast<double>(plate.tilt_vector.y) / 65536.0;
+        d["plate_type"] = static_cast<int64_t>(plate.plate_type);
+        d["base_elevation"] = static_cast<double>(plate.base_elevation) / 65536.0;
+        d["crust_thickness"] = static_cast<double>(plate.crust_thickness) / 65536.0;
+        d["crust_rigidity"] = static_cast<double>(plate.crust_rigidity) / 65536.0;
+        arr.push_back(d);
+    }
+    return arr;
+}
+
+godot::PackedFloat32Array SimBridge::get_wave_cage_data(double sea_level) const {
+    godot::PackedFloat32Array cage;
+    int32_t w = _world.get_map_width();
+    int32_t h = _world.get_map_height();
+    if (w <= 0 || h <= 0) return cage;
+
+    const auto& elevation = _world.get_elevation();
+    if (elevation.size() < static_cast<size_t>(w * h)) return cage;
+
+    size_t total_floats = static_cast<size_t>(w * h * 4);
+    cage.resize(static_cast<int64_t>(total_floats));
+    float* ptr = cage.ptrw();
+
+    float sea_lvl = static_cast<float>(sea_level);
+
+    for (int32_t y = 0; y < h; ++y) {
+        for (int32_t x = 0; x < w; ++x) {
+            size_t idx = static_cast<size_t>(y * w + x);
+            float el = static_cast<float>(elevation[idx]) / 65536.0f;
+            float depth = std::max(0.0f, sea_lvl - el);
+
+            // Compute local gradient for shoreline normal vectors (uphill direction towards land)
+            int32_t x_left = std::max(0, x - 1);
+            int32_t x_right = std::min(w - 1, x + 1);
+            int32_t y_down = std::max(0, y - 1);
+            int32_t y_up = std::min(h - 1, y + 1);
+
+            float el_l = static_cast<float>(elevation[y * w + x_left]) / 65536.0f;
+            float el_r = static_cast<float>(elevation[y * w + x_right]) / 65536.0f;
+            float el_d = static_cast<float>(elevation[y_down * w + x]) / 65536.0f;
+            float el_u = static_cast<float>(elevation[y_up * w + x]) / 65536.0f;
+
+            float grad_x = (el_r - el_l) * 0.5f;
+            float grad_y = (el_u - el_d) * 0.5f;
+            float grad_len = std::sqrt(grad_x * grad_x + grad_y * grad_y);
+
+            float norm_x = 0.0f;
+            float norm_y = 0.0f;
+            if (grad_len > 0.001f) {
+                norm_x = grad_x / grad_len;
+                norm_y = grad_y / grad_len;
+            }
+
+            // Continuous signed distance to shoreline approximation
+            float dist_to_shore = el - sea_lvl;
+
+            size_t out_idx = idx * 4;
+            ptr[out_idx + 0] = depth;          // R: Water depth (0 on land, >0 in water)
+            ptr[out_idx + 1] = dist_to_shore;  // G: Signed distance / elevation relative to sea level
+            ptr[out_idx + 2] = norm_x;         // B: Shore normal X (uphill towards land)
+            ptr[out_idx + 3] = norm_y;         // A: Shore normal Y
+        }
+    }
+
+    return cage;
 }

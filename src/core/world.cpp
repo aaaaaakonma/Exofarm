@@ -1,11 +1,6 @@
 #include "world.h"
 #include "item.h"
 #include "player.h"
-#include "enemy.h"
-#include "wall.h"
-#include "collision.h"
-#include "cordic.h"
-#include "map_generator.h"
 #include <cstring>
 #include <algorithm>
 #include <iostream>
@@ -26,6 +21,7 @@ SimWorld::SimWorld() : _tick(0), _next_id(1), _rng_shotgun(0), _rng_tornado(0), 
  * from this master seed to ensure 100% determinism.
  */
 void SimWorld::set_seed(uint64_t seed) {
+    _tectonic_config.seed = seed;
     SplitMix64 master(seed);
     _shotgun_seed = master.next();
     _tornado_seed = master.next();
@@ -64,9 +60,7 @@ void SimWorld::tick(const InputFrame &input) {
         }
 
         // Update chunk tiers based on player locations
-        if (_tick == 369) { std::cout << "  - update_chunk_tiers starting" << std::endl; std::flush(std::cout); }
         update_chunk_tiers();
-        if (_tick == 369) { std::cout << "  - update_chunk_tiers done" << std::endl; std::flush(std::cout); }
 
         int32_t chunk_w = (_map_width + CHUNK_SIZE - 1) / CHUNK_SIZE;
         int32_t chunk_h = (_map_height + CHUNK_SIZE - 1) / CHUNK_SIZE;
@@ -114,16 +108,12 @@ void SimWorld::tick(const InputFrame &input) {
         _tick_hit_pairs.clear();
 
         // Step 1: Resolve AI decisions and basic movement
-        if (_tick == 369) { std::cout << "  - tick_movement starting" << std::endl; std::flush(std::cout); }
         tick_movement(input, px, py, player_found);
-        if (_tick == 369) { std::cout << "  - tick_movement done" << std::endl; std::flush(std::cout); }
 
         tick_bots();
 
         // Step 2: Resolve Physics and Combat collisions
-        if (_tick == 369) { std::cout << "  - tick_collision starting" << std::endl; std::flush(std::cout); }
         tick_collision(px, py, player_found, act_sq);
-        if (_tick == 369) { std::cout << "  - tick_collision done" << std::endl; std::flush(std::cout); }
 
         // Step 3: Merge frame-local hits into the permanent history
         // Uses set_union to maintain a sorted, unique history of "who hit whom"
@@ -141,14 +131,10 @@ void SimWorld::tick(const InputFrame &input) {
         }
 
         // Step 4: Finalize entity deaths and memory recycling
-        if (_tick == 369) { std::cout << "  - tick_cleanup starting" << std::endl; std::flush(std::cout); }
         tick_cleanup();
-        if (_tick == 369) { std::cout << "  - tick_cleanup done" << std::endl; std::flush(std::cout); }
         
         // Step 5: Tick environment (soil moisture, aquifers, evaporation)
-        if (_tick == 369) { std::cout << "  - tick_environment starting" << std::endl; std::flush(std::cout); }
         tick_environment();
-        if (_tick == 369) { std::cout << "  - tick_environment done" << std::endl; std::flush(std::cout); }
 
         // Step 6: Tick crops
         tick_crops();
@@ -207,7 +193,6 @@ BisectSnapshot SimWorld::snapshot() const {
     snap.entity_recycle_bin = _entity_recycle_bin;
     snap.attack_recycle_bin = _attack_recycle_bin;
     snap.hit_pairs = _hit_pairs;
-    snap.walls = _walls;
 
     // Map properties for farming game
     snap.map_width = _map_width;
@@ -272,7 +257,6 @@ void SimWorld::restore(const BisectSnapshot &snap) {
     _entity_recycle_bin = snap.entity_recycle_bin;
     _attack_recycle_bin = snap.attack_recycle_bin;
     _hit_pairs = snap.hit_pairs;
-    _walls = snap.walls;
 
     // Map properties for farming game
     _map_width = snap.map_width;
@@ -316,14 +300,11 @@ void SimWorld::restore(const BisectSnapshot &snap) {
     _hydraulic_graph.set_river_belts(snap.hydraulic_river_belts);
     
     // Geometry Rebuild
-    _wall_grid.build(_walls);
-    _entity_grid.build(_walls);
     
     // Rebuild Entity Grid using entity positions
     auto& chaos = _entities.get_chaos();
     for (size_t i = 0; i < chaos.size(); ++i) {
         if (!(chaos.flags[i] & (uint8_t)EntityFlags::DEAD)) {
-            _entity_grid.insert(chaos.dense_ids[i], chaos.positions_x[i], chaos.positions_y[i]);
         }
         chaos.node_ids[i] = -1;
     }
@@ -386,7 +367,6 @@ uint64_t SimWorld::get_state_hash() const {
     hash_vec(_entity_recycle_bin);
     hash_vec(_attack_recycle_bin);
     hash_vec(_hit_pairs);
-    hash_vec(_walls); 
 
     // Hash map properties for farming game
     hash_combine(&_map_width, sizeof(_map_width));
@@ -475,35 +455,6 @@ uint64_t SimWorld::get_state_hash() const {
 }
 
 /**
- * Elastic Collision Resolution between two solid entities.
- * Resolves penetration via position shifting and applies impulse-based velocity changes.
- */
-inline void handle_physical_physical(uint32_t i, uint32_t j, const OverlapResult& res, int64_t& curr_x, int64_t& curr_y, int64_t& curr_vx, int64_t& curr_vy, ChaosState::RestrictedView& v, SimWorld& world) {
-    // 1. Position Resolution (Anti-overlap)
-    const int64_t sep_x = mul_fixed(res.normal_x, (res.penetration >> 1) + 128);
-    const int64_t sep_y = mul_fixed(res.normal_y, (res.penetration >> 1) + 128);
-    
-    curr_x += sep_x;
-    curr_y += sep_y;
-    v.positions_x[j] -= sep_x;
-    v.positions_y[j] -= sep_y;
-
-    // 2. Velocity Resolution (Impulse)
-    int64_t rv_x = curr_vx - v.velocities_x[j];
-    int64_t rv_y = curr_vy - v.velocities_y[j];
-    int64_t dot = mul_fixed(rv_x, res.normal_x) + mul_fixed(rv_y, res.normal_y);
-
-    if (dot < 0) {
-        int64_t impulse_x = mul_fixed(dot, res.normal_x) >> 1;
-        int64_t impulse_y = mul_fixed(dot, res.normal_y) >> 1;
-        curr_vx -= impulse_x;
-        curr_vy -= impulse_y;
-        v.velocities_x[j] += impulse_x;
-        v.velocities_y[j] += impulse_y;
-    }
-}
-
-/**
  * Processes movement and AI logic for all active entities.
  */
 void SimWorld::tick_movement(const InputFrame &input, int64_t px, int64_t py, bool player_found) {
@@ -518,15 +469,7 @@ void SimWorld::tick_movement(const InputFrame &input, int64_t px, int64_t py, bo
 
         EntityType type = v.types[i];
 
-        if (type == EntityType::ENEMY) {
-            // Run Enemy AI tick
-            Enemy::tick((uint32_t)i, player_found ? px : v.positions_x[i], player_found ? py : v.positions_y[i], *this, v);
-            // Memory Safety: Check if spawning changed vector capacity
-            if (chaos.dense_ids.capacity() != start_capacity) {
-                v = chaos.get_restricted_view();
-                start_capacity = chaos.dense_ids.capacity();
-            }
-        } else if (type == EntityType::PLAYER) {
+        if (type == EntityType::PLAYER) {
             // Run Player control tick
             Player::tick(v.dense_ids[i], input, *this);
             if (chaos.dense_ids.capacity() != start_capacity) {
@@ -538,84 +481,9 @@ void SimWorld::tick_movement(const InputFrame &input, int64_t px, int64_t py, bo
 }
 
 /**
- * Resolves all collisions (Solid Entity-Wall, Entity-Entity).
+ * Resolves all collisions.
  */
 void SimWorld::tick_collision(int64_t px, int64_t py, bool player_found, int64_t act_sq) {
-    ChaosState& chaos = _entities.get_chaos();
-    auto v = chaos.get_restricted_view();
-    const size_t entity_count = chaos.size();
-
-    // Solid Entity Physics
-    for (size_t i = 0; i < entity_count; ++i) {
-        if ((v.flags[i] & (uint8_t)EntityFlags::DEAD) || !(v.flags[i] & (uint8_t)EntityFlags::ACTIVE)) continue;
-        
-        int64_t old_x = v.positions_x[i], old_y = v.positions_y[i];
-        int64_t curr_x = old_x, curr_y = old_y;
-        int64_t curr_vx = v.velocities_x[i], curr_vy = v.velocities_y[i];
-        const int64_t radius_i = v.radii[i];
-        
-        // Check if entity is a Drone bot (drones fly over walls)
-        bool is_drone = false;
-        if (v.types[i] == EntityType::BOT) {
-            for (const auto& b : _bot_states) {
-                if (b.entity_id == v.dense_ids[i] && b.bot_type == (uint8_t)BotType::DRONE) {
-                    is_drone = true;
-                    break;
-                }
-            }
-        }
-
-        // Solid Wall Resolution (Iterative sliding response)
-        if (!is_drone) {
-            for (int iter = 0; iter < 2; ++iter) {
-                OverlapResult best_res = {false, 0, 0, 0};
-                _wall_grid.query(curr_x, curr_y, radius_i, [&](uint32_t wall_idx) {
-                    if (_walls[wall_idx].user_data == 1) return; // Wall disabled by bridge
-                    OverlapResult res = Wall::test_circle_single(curr_x, curr_y, radius_i, _walls[wall_idx]);
-                    if (res.hit && (!best_res.hit || res.penetration > best_res.penetration)) best_res = res;
-                });
-                if (best_res.hit) {
-                    curr_x += mul_fixed(best_res.normal_x, best_res.penetration);
-                    curr_y += mul_fixed(best_res.normal_y, best_res.penetration);
-                    int64_t dot = mul_fixed(curr_vx, best_res.normal_x) + mul_fixed(curr_vy, best_res.normal_y);
-                    if (dot < 0) {
-                        curr_vx -= mul_fixed(dot, best_res.normal_x);
-                        curr_vy -= mul_fixed(dot, best_res.normal_y);
-                    }
-                } else break;
-            }
-        }
-
-        // Entity-to-Entity Physical Pushing
-        Experimental::AABB my_aabb = { curr_x - radius_i, curr_y - radius_i, curr_x + radius_i, curr_y + radius_i };
-        _entity_grid.query(my_aabb, [&](EntityID entity_id) {
-            const uint32_t j = _entities.get_dense_idx(entity_id);
-            if (j <= (uint32_t)i || (v.flags[j] & (uint8_t)EntityFlags::DEAD)) return;
-
-            int64_t dx = v.positions_x[j] - curr_x;
-            int64_t dy = v.positions_y[j] - curr_y;
-            int64_t r_sum = radius_i + v.radii[j];
-            int64_t dist_sq = mul_fixed(dx, dx) + mul_fixed(dy, dy);
-
-            if (dist_sq <= mul_fixed(r_sum, r_sum)) {
-                OverlapResult res; res.hit = true;
-                int64_t dist = sqrt_fixed(dist_sq);
-                res.penetration = r_sum - dist;
-                if (dist < 10) { res.normal_x = 0; res.normal_y = ONE; }
-                else {
-                    int64_t inv_dist = inv_sqrt_fixed(dist_sq);
-                    res.normal_x = mul_fixed(-dx, inv_dist);
-                    res.normal_y = mul_fixed(-dy, inv_dist);
-                }
-                handle_physical_physical((uint32_t)i, j, res, curr_x, curr_y, curr_vx, curr_vy, v, *this);
-            }
-        });
-
-        // Write-back resolved state
-        v.positions_x[i] = curr_x; v.positions_y[i] = curr_y;
-        v.velocities_x[i] = curr_vx; v.velocities_y[i] = curr_vy;
-        _entity_grid.update(v.dense_ids[i], old_x, old_y, curr_x, curr_y);
-    }
 }
 
 /**
@@ -627,8 +495,6 @@ EntityID SimWorld::spawn_entity(EntityType type, int64_t x, int64_t y, int64_t r
     uint32_t idx = _entities.get_dense_idx(id);
     _entities.get_chaos().flags[idx] |= (uint8_t)EntityFlags::ACTIVE;
 
-    _entity_grid.resize_entity_map(id + 128);
-    _entity_grid.insert(id, x, y);
     _sync_node_aabb(idx);
 
     return id;
@@ -670,11 +536,6 @@ void SimWorld::tick_cleanup() {
  * Physical removal of an entity. Updates spatial trees and SoA indices.
  */
 void SimWorld::kill_entity(EntityID id) {
-    uint32_t idx = _entities.get_dense_idx(id);
-    if (idx != 0xFFFFFFFF) {
-        _entity_grid.remove(id);
-    }
-
     _entities.kill(id, _entity_recycle_bin, _hit_pairs, _attack_recycle_bin);
 }
 
@@ -707,34 +568,267 @@ Equipment& SimWorld::get_equipment_mut(EntityID id) {
 /**
  * Adds static geometry to the world.
  */
-void SimWorld::add_wall(int64_t x, int64_t y, int64_t w, int64_t h) {
-    _walls.push_back({x, y, w, h, 0});
-}
-
-void SimWorld::finalize_walls() {
-    _wall_grid.build(_walls);
-    _entity_grid.build(_walls);
-}
-
-void SimWorld::generate_map_cellular_automata(uint64_t seed, int64_t width, int64_t height, int64_t cell_size_fixed, int32_t iterations, int32_t fill_prob) {
-    _last_generator = std::make_unique<Generation::MapGenerator>();
-    _last_generator->generate_map(*this, seed, width, height, cell_size_fixed);
-}
-
 void SimWorld::generate_player_map(uint64_t seed, int64_t width, int64_t height, int64_t cell_size_fixed) {
-    _last_generator = std::make_unique<Generation::MapGenerator>();
-    _last_generator->generate_map(*this, seed, width, height, cell_size_fixed);
+    set_map_dimensions((int32_t)width, (int32_t)height, cell_size_fixed);
+
+    Tectonics::ContinuousTectonicHeightmap::Config cfg = _tectonic_config;
+    cfg.seed = seed;
+    cfg.world_width = width * cell_size_fixed;
+    cfg.world_height = height * cell_size_fixed;
+    if (cfg.num_plates <= 0) cfg.num_plates = 14;
+    _tectonic_heightmap.init(cfg);
+
+    int32_t w = static_cast<int32_t>(width);
+    int32_t h = static_cast<int32_t>(height);
+    size_t total_cells = static_cast<size_t>(w) * h;
+
+    // --- Generate tectonic heightfield ---
+    _tectonic_heightmap.generate_grid(w, h, cell_size_fixed, _elevation);
+
+    int32_t best_spawn_x = w / 2;
+    int32_t best_spawn_y = h / 2;
+    int64_t min_spawn_dist_to_ideal = 0x7FFFFFFFFFFFFFFF;
+
+    // Gradient sampling offset for orographic moisture (one cell offset)
+    const int64_t GRAD_STEP = cell_size_fixed;
+
+    for (int32_t y = 0; y < h; ++y) {
+        int64_t py = static_cast<int64_t>(y) * cell_size_fixed;
+        for (int32_t x = 0; x < w; ++x) {
+            int64_t px = static_cast<int64_t>(x) * cell_size_fixed;
+            size_t idx = static_cast<size_t>(y) * w + x;
+
+            // --- Read elevation ---
+            int64_t el = _elevation[idx];
+
+            // --- Tectonic Sample for structural metadata (boundary type, plate type) ---
+            Tectonics::TectonicSample sample = _tectonic_heightmap.sample(px, py);
+
+            // --- Climate Noise ---
+            // Base moisture from FBm (scale independent of elevation)
+            int64_t moisture_base = SimMath::fbm2d(mul_fixed(px, 1200), mul_fixed(py, 1200), seed + 555, 4);
+            // Base temperature: latitude-like gradient + noise
+            int64_t temp = SimMath::fbm2d(mul_fixed(px, 1000), mul_fixed(py, 1000), seed + 777, 3);
+
+            // --- Orographic Moisture Effect ---
+            // Sample elevation one step in the prevailing wind direction (west→east, i.e. +x)
+            // to find local rain-shadow vs. windward slope
+            int64_t el_windward = (x > 0) ? _elevation[static_cast<size_t>(y) * w + (x - 1)] : _tectonic_heightmap.sample(px - GRAD_STEP, py).elevation_final;
+            int64_t slope_rise = el - el_windward; // positive = ascending slope = windward = more rain
+            // Windward slopes get +moisture, leeward get -moisture
+            int64_t orographic_boost = std::clamp(slope_rise * 3, -18000LL, 18000LL);
+            int64_t moisture = moisture_base + orographic_boost;
+
+            // --- Biome + Surface Classification ---
+            // Biome codes: 0=OCEAN 1=TUNDRA 2=DESERT 3=GRASSLAND 4=FOREST
+            //              5=TROPICAL_RAINFOREST 6=SWAMP 7=MOUNTAIN 8=BEACH/COAST
+            uint8_t b = 0;  // OCEAN default
+            uint8_t st = 0; // WATER default
+
+            // Sea level = 0, mountain threshold = 16m (relative to 8m base), beach = 0..3m
+            if (el <= 0) {
+                b = 0;   // OCEAN
+                st = 0;  // WATER
+            } else if (el > (16LL * ONE)) {
+                b = 7;   // MOUNTAIN
+                st = 4;  // STONE / ROCK
+            } else if (el < (3LL * ONE)) {
+                // Coastal beach/shoreline zone
+                b = 8;   // BEACH / COAST
+                st = 2;  // SAND
+            } else {
+                // Land biome classification: temperature × moisture Whittaker diagram
+                if (temp < -16000) {
+                    // Very cold: tundra regardless of moisture
+                    b = 1;  // TUNDRA / GLACIER
+                    st = 2; // FROZEN DIRT / TUNDRA
+                } else if (moisture < -14000) {
+                    // Very dry
+                    if (temp > 8000) {
+                        b = 2;  // HOT DESERT
+                        st = 2; // SAND
+                    } else {
+                        b = 2;  // COLD DESERT / STEPPE
+                        st = 2; // GRAVEL / DRY SOIL
+                    }
+                } else if (moisture > 24000) {
+                    // Very wet
+                    if (temp > 10000) {
+                        b = 5;  // TROPICAL RAINFOREST
+                        st = 1; // RICH SOIL
+                    } else {
+                        b = 4;  // TEMPERATE RAINFOREST
+                        st = 1; // SOIL
+                    }
+                } else if (moisture > 8000) {
+                    b = 4;  // FOREST
+                    st = 1; // SOIL
+                } else if (el < (8LL * ONE) && moisture > 4000) {
+                    b = 6;  // SWAMP / WETLANDS
+                    st = 1; // MUD / SOIL
+                } else {
+                    b = 3;  // GRASSLAND / SAVANNA
+                    st = 1; // GRASS / SOIL
+                }
+
+                // Spawn scoring: prefer grassland/forest at moderate elevation (~8..25m) near center
+                if (b == 3 || b == 4) {
+                    int64_t dist_to_center = abs_fixed(x - w / 2) + abs_fixed(y - h / 2);
+                    int64_t score = dist_to_center + abs_fixed(el - (18LL * ONE)) / 4;
+                    if (score < min_spawn_dist_to_ideal) {
+                        min_spawn_dist_to_ideal = score;
+                        best_spawn_x = x;
+                        best_spawn_y = y;
+                    }
+                }
+            }
+
+            _biome[idx] = b;
+            _surface_type[idx] = st;
+
+            // --- Soil Nutrients (biome-differentiated profiles) ---
+            if (b != 0 && b != 8) {
+                // Base compactness from slope: steeper = more compact, harder to till
+                int64_t slope_mag = abs_fixed(slope_rise);
+                int64_t compactness_base = 30LL * ONE + std::clamp(slope_mag * 2, 0LL, 30LL * ONE);
+
+                switch (b) {
+                    case 1: // TUNDRA — cold, low N, high compactness (permafrost)
+                        _soil_nitrogen[idx]     = static_cast<int32_t>(std::clamp(40LL * ONE + moisture_base, 15LL * ONE, 80LL * ONE));
+                        _soil_phosphorus[idx]   = static_cast<int32_t>(50LL * ONE);
+                        _soil_potassium[idx]    = static_cast<int32_t>(45LL * ONE);
+                        _soil_calcium[idx]      = static_cast<int32_t>(55LL * ONE);
+                        _soil_magnesium[idx]    = static_cast<int32_t>(30LL * ONE);
+                        _soil_sulfur[idx]       = static_cast<int32_t>(20LL * ONE);
+                        _soil_compactness[idx]  = static_cast<int32_t>(std::clamp(compactness_base + 20LL * ONE, 40LL * ONE, 90LL * ONE));
+                        break;
+                    case 2: // DESERT — low everything, high compaction, some potassium from mineral weathering
+                        _soil_nitrogen[idx]     = static_cast<int32_t>(20LL * ONE);
+                        _soil_phosphorus[idx]   = static_cast<int32_t>(30LL * ONE);
+                        _soil_potassium[idx]    = static_cast<int32_t>(std::clamp(70LL * ONE + el / 2, 40LL * ONE, 120LL * ONE));
+                        _soil_calcium[idx]      = static_cast<int32_t>(80LL * ONE); // calcareous desert soils
+                        _soil_magnesium[idx]    = static_cast<int32_t>(35LL * ONE);
+                        _soil_sulfur[idx]       = static_cast<int32_t>(15LL * ONE);
+                        _soil_compactness[idx]  = static_cast<int32_t>(std::clamp(compactness_base + 15LL * ONE, 50LL * ONE, 95LL * ONE));
+                        break;
+                    case 3: // GRASSLAND — good N, moderate P, lower compaction
+                        _soil_nitrogen[idx]     = static_cast<int32_t>(std::clamp(110LL * ONE + moisture * 2, 60LL * ONE, 200LL * ONE));
+                        _soil_phosphorus[idx]   = static_cast<int32_t>(std::clamp(90LL * ONE + temp, 40LL * ONE, 160LL * ONE));
+                        _soil_potassium[idx]    = static_cast<int32_t>(std::clamp(100LL * ONE + el / 3, 50LL * ONE, 180LL * ONE));
+                        _soil_calcium[idx]      = static_cast<int32_t>(70LL * ONE);
+                        _soil_magnesium[idx]    = static_cast<int32_t>(50LL * ONE);
+                        _soil_sulfur[idx]       = static_cast<int32_t>(35LL * ONE);
+                        _soil_compactness[idx]  = static_cast<int32_t>(std::clamp(compactness_base, 25LL * ONE, 60LL * ONE));
+                        break;
+                    case 4: // FOREST — rich N from litter, good P, moderate everything
+                        _soil_nitrogen[idx]     = static_cast<int32_t>(std::clamp(140LL * ONE + moisture * 2, 80LL * ONE, 240LL * ONE));
+                        _soil_phosphorus[idx]   = static_cast<int32_t>(std::clamp(100LL * ONE + temp, 50LL * ONE, 200LL * ONE));
+                        _soil_potassium[idx]    = static_cast<int32_t>(std::clamp(110LL * ONE + el / 2, 60LL * ONE, 200LL * ONE));
+                        _soil_calcium[idx]      = static_cast<int32_t>(65LL * ONE);
+                        _soil_magnesium[idx]    = static_cast<int32_t>(55LL * ONE);
+                        _soil_sulfur[idx]       = static_cast<int32_t>(40LL * ONE);
+                        _soil_compactness[idx]  = static_cast<int32_t>(std::clamp(compactness_base, 20LL * ONE, 55LL * ONE));
+                        break;
+                    case 5: // TROPICAL RAINFOREST — very high N/P but leached, low compaction
+                        _soil_nitrogen[idx]     = static_cast<int32_t>(std::clamp(160LL * ONE + moisture, 100LL * ONE, 250LL * ONE));
+                        _soil_phosphorus[idx]   = static_cast<int32_t>(std::clamp(60LL * ONE + temp, 30LL * ONE, 130LL * ONE)); // leached
+                        _soil_potassium[idx]    = static_cast<int32_t>(70LL * ONE);
+                        _soil_calcium[idx]      = static_cast<int32_t>(45LL * ONE);
+                        _soil_magnesium[idx]    = static_cast<int32_t>(40LL * ONE);
+                        _soil_sulfur[idx]       = static_cast<int32_t>(30LL * ONE);
+                        _soil_compactness[idx]  = static_cast<int32_t>(std::clamp(compactness_base - 5LL * ONE, 15LL * ONE, 45LL * ONE));
+                        break;
+                    case 6: // SWAMP / WETLAND — waterlogged, anaerobic, high N, very low compaction
+                        _soil_nitrogen[idx]     = static_cast<int32_t>(std::clamp(130LL * ONE + moisture, 80LL * ONE, 220LL * ONE));
+                        _soil_phosphorus[idx]   = static_cast<int32_t>(75LL * ONE);
+                        _soil_potassium[idx]    = static_cast<int32_t>(60LL * ONE);
+                        _soil_calcium[idx]      = static_cast<int32_t>(50LL * ONE);
+                        _soil_magnesium[idx]    = static_cast<int32_t>(45LL * ONE);
+                        _soil_sulfur[idx]       = static_cast<int32_t>(50LL * ONE); // anaerobic sulfur
+                        _soil_compactness[idx]  = static_cast<int32_t>(std::clamp(compactness_base - 15LL * ONE, 10LL * ONE, 35LL * ONE));
+                        break;
+                    case 7: // MOUNTAIN — rocky, thin soil, high compaction, low nutrients
+                        _soil_nitrogen[idx]     = static_cast<int32_t>(std::clamp(30LL * ONE + moisture_base, 10LL * ONE, 70LL * ONE));
+                        _soil_phosphorus[idx]   = static_cast<int32_t>(40LL * ONE);
+                        _soil_potassium[idx]    = static_cast<int32_t>(std::clamp(50LL * ONE + el / 4, 25LL * ONE, 100LL * ONE));
+                        _soil_calcium[idx]      = static_cast<int32_t>(90LL * ONE); // limestone/carbonate rich
+                        _soil_magnesium[idx]    = static_cast<int32_t>(60LL * ONE); // ultramafic uplift
+                        _soil_sulfur[idx]       = static_cast<int32_t>(25LL * ONE);
+                        _soil_compactness[idx]  = static_cast<int32_t>(std::clamp(compactness_base + 25LL * ONE, 60LL * ONE, 100LL * ONE));
+                        break;
+                    default:
+                        _soil_nitrogen[idx]     = static_cast<int32_t>(60LL * ONE);
+                        _soil_phosphorus[idx]   = static_cast<int32_t>(50LL * ONE);
+                        _soil_potassium[idx]    = static_cast<int32_t>(55LL * ONE);
+                        _soil_calcium[idx]      = static_cast<int32_t>(60LL * ONE);
+                        _soil_magnesium[idx]    = static_cast<int32_t>(40LL * ONE);
+                        _soil_sulfur[idx]       = static_cast<int32_t>(30LL * ONE);
+                        _soil_compactness[idx]  = static_cast<int32_t>(compactness_base);
+                        break;
+                }
+            }
+
+            // --- Mineral Type Generation ---
+            // Based on tectonic context: boundary type, plate type, elevation
+            // Mineral codes: 0=none, 1=silica/quartz, 2=iron_ore, 3=copper, 4=limestone, 5=coal, 6=sulfur/volcanic, 7=granite/metamorphic
+            uint8_t mineral = 0;
+            if (b != 0) { // Only assign minerals on land
+                Tectonics::BoundaryType btype = sample.boundary_type;
+                bool is_continental = (sample.primary_type == Tectonics::PlateType::CONTINENTAL);
+
+                // Use a hash-based noise for sparse placement (not every tile has minerals)
+                uint32_t mineral_hash = SimMath::hash2d((int32_t)x, (int32_t)y, seed + 999);
+                bool has_mineral = (mineral_hash & 0xF) < 3; // ~18% of land tiles have minerals
+
+                if (has_mineral) {
+                    if (b == 7) {
+                        // Mountains: metamorphic and igneous rocks dominate
+                        uint32_t mtype = mineral_hash & 0xFF;
+                        if (mtype < 50)       mineral = 7; // granite/metamorphic
+                        else if (mtype < 110) mineral = 2; // iron ore (magmatic)
+                        else if (mtype < 160) mineral = 3; // copper (hydrothermal)
+                        else                  mineral = 1; // quartz/silica
+                    } else if (btype == Tectonics::BoundaryType::CONVERGENT_SUBDUCTION ||
+                               btype == Tectonics::BoundaryType::CONVERGENT_ISLAND_ARC) {
+                        // Volcanic arcs: sulfur, copper, iron
+                        uint32_t mtype = mineral_hash & 0xFF;
+                        if (mtype < 80)       mineral = 6; // sulfur/volcanic
+                        else if (mtype < 160) mineral = 3; // copper porphyry deposits
+                        else                  mineral = 2; // iron
+                    } else if (btype == Tectonics::BoundaryType::CONVERGENT_CONTINENTAL_COLLISION) {
+                        // Collision zones: metamorphic minerals
+                        mineral = ((mineral_hash & 0x3) < 2) ? 7 : 2;
+                    } else if (btype == Tectonics::BoundaryType::DIVERGENT_CONTINENTAL_RIFT) {
+                        // Rift valleys: evaporites, potassic minerals
+                        mineral = 4; // limestone/evaporite
+                    } else if (is_continental) {
+                        // Stable continental interior: sedimentary minerals
+                        uint32_t mtype = mineral_hash & 0xFF;
+                        if (moisture > 10000 && el < (20LL * ONE)) {
+                            mineral = 5; // coal (swampy carboniferous deposits)
+                        } else if (mtype < 80) {
+                            mineral = 4; // limestone
+                        } else if (mtype < 140) {
+                            mineral = 1; // silica/quartz
+                        } else {
+                            mineral = 2; // iron
+                        }
+                    }
+                }
+            }
+            _mineral_type[idx] = mineral;
+        }
+    }
+
+    _starter_spawn_x = best_spawn_x;
+    _starter_spawn_y = best_spawn_y;
 }
 
-void SimWorld::clear_walls() {
-    _walls.clear();
-    _wall_grid.build(_walls);
-    _entity_grid.build(_walls);
-}
 
 void SimWorld::clear_entities() {
+
+
     _entities.clear();
-    _entity_grid.clear_entities();
     _entity_recycle_bin.clear();
     _attack_recycle_bin.clear();
     _hit_pairs.clear();
@@ -878,7 +972,6 @@ std::vector<uint8_t> SimWorld::serialize_snapshot(const BisectSnapshot &snap) {
     write_vec(snap.entity_recycle_bin);
     write_vec(snap.attack_recycle_bin);
     write_vec(snap.hit_pairs);
-    write_vec(snap.walls);
 
     // Map properties for farming game
     buffer.insert(buffer.end(), reinterpret_cast<const uint8_t*>(&snap.map_width), reinterpret_cast<const uint8_t*>(&snap.map_width) + sizeof(int32_t));
@@ -1006,7 +1099,6 @@ const uint8_t* SimWorld::deserialize_snapshot(BisectSnapshot &snap, const uint8_
     read_vec(snap.entity_recycle_bin);
     read_vec(snap.attack_recycle_bin);
     read_vec(snap.hit_pairs);
-    read_vec(snap.walls);
 
     // Map properties for farming game
     read_pod(snap.map_width);
@@ -2026,15 +2118,9 @@ void SimWorld::_do_place_structure(int32_t x, int32_t y, uint8_t structure_type)
     _structure_type[idx] = structure_type;
     _water_pressure[idx] = 0;
 
-    // If placing a bridge, disable the wall collider for that tile
+    // If placing a bridge
     if (structure_type == (uint8_t)StructureType::BRIDGE) {
-        int64_t wx = (int64_t)x * _cell_size_fixed;
-        int64_t wy = (int64_t)y * _cell_size_fixed;
-        for (auto& w : _walls) {
-            if (w.x == wx && w.y == wy && w.width == _cell_size_fixed && w.height == _cell_size_fixed) {
-                w.user_data = 1; // 1 = disabled by bridge
-            }
-        }
+        // Bridge placed
     } else if (structure_type == (uint8_t)StructureType::PUMP) {
         // Register pump extraction with hydraulic graph (1.5 units/tick)
         _hydraulic_graph.add_pump(idx, 15LL * ONE / 10);
@@ -2045,13 +2131,7 @@ void SimWorld::_do_remove_structure(int32_t x, int32_t y) {
     if (x < 0 || x >= _map_width || y < 0 || y >= _map_height) return;
     int32_t idx = y * _map_width + x;
     if (_structure_type[idx] == (uint8_t)StructureType::BRIDGE) {
-        int64_t wx = (int64_t)x * _cell_size_fixed;
-        int64_t wy = (int64_t)y * _cell_size_fixed;
-        for (auto& w : _walls) {
-            if (w.x == wx && w.y == wy && w.width == _cell_size_fixed && w.height == _cell_size_fixed) {
-                w.user_data = 0; // re-enabled
-            }
-        }
+        // Bridge removed
     } else if (_structure_type[idx] == (uint8_t)StructureType::PUMP) {
         _hydraulic_graph.remove_pump(idx);
     }
@@ -2095,8 +2175,6 @@ void SimWorld::_do_spawn_bot(EntityID bot_id, uint8_t bot_type, int64_t x, int64
     uint32_t idx = _entities.get_dense_idx(bot_id);
     _entities.get_chaos().flags[idx] |= (uint8_t)EntityFlags::ACTIVE;
 
-    _entity_grid.resize_entity_map(bot_id + 128);
-    _entity_grid.insert(bot_id, x, y);
     _sync_node_aabb(idx);
 
     BotState b;
@@ -2299,7 +2377,6 @@ void SimWorld::tick_bots() {
             chaos.velocities_y[idx] = mul_fixed(dir_y, speed);
             
             // Integrate position manually to ensure they update for this tick
-            _entity_grid.update(b.entity_id, chaos.positions_x[idx], chaos.positions_y[idx], chaos.positions_x[idx] + chaos.velocities_x[idx], chaos.positions_y[idx] + chaos.velocities_y[idx]);
             chaos.positions_x[idx] += chaos.velocities_x[idx];
             chaos.positions_y[idx] += chaos.velocities_y[idx];
             _sync_node_aabb(idx);

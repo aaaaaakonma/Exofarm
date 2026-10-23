@@ -1,13 +1,24 @@
 #pragma once
-#include "shapes.h"
+
+
+#ifndef SIM_HEADLESS
 #include <godot_cpp/variant/utility_functions.hpp>
+using namespace godot;
+#else
+#include <iostream>
+struct UtilityFunctions {
+    template<typename... Args>
+    static void print(Args&&... args) {
+        (std::cout << ... << args) << "\n";
+    }
+};
+#endif
+
 #include <vector>
 #include <cstdint>
 #include <string>
 #include <fstream>
 #include <map>
-
-using namespace godot;
 
 enum class TileAnchorType : uint32_t {
     EAST = 0,
@@ -31,7 +42,7 @@ struct TileAnchor {
     int64_t x, y;
     TileAnchorType type;
     uint64_t name_hash = 0;
-    SimAABB auto_wall; // Geometry to spawn if this anchor is NOT connected
+    
 };
 
 struct TileBlueprint {
@@ -43,9 +54,9 @@ struct TileBlueprint {
     int64_t height;
     int64_t bound_x = 0;
     int64_t bound_y = 0;
-    std::vector<SimAABB> walls;
+    
     std::vector<TileAnchor> anchors;
-    std::vector<SimPolygon> polygons;
+    
 };
 
 class TileRegistry {
@@ -111,13 +122,9 @@ public:
 
             uint32_t wall_count;
             file.read(reinterpret_cast<char*>(&wall_count), 4);
-            bp.walls.resize(wall_count);
-            for (uint32_t w = 0; w < wall_count; ++w) {
-                file.read(reinterpret_cast<char*>(&bp.walls[w].x), 8);
-                file.read(reinterpret_cast<char*>(&bp.walls[w].y), 8);
-                file.read(reinterpret_cast<char*>(&bp.walls[w].width), 8);
-                file.read(reinterpret_cast<char*>(&bp.walls[w].height), 8);
-                bp.walls[w].user_data = 0;
+                        for (uint32_t w = 0; w < wall_count; ++w) {
+                int64_t dummy[4];
+                file.read(reinterpret_cast<char*>(dummy), 32);
             }
 
             uint32_t anchor_count;
@@ -135,49 +142,25 @@ public:
                 }
                 
                 if (version >= 3) {
-                    file.read(reinterpret_cast<char*>(&bp.anchors[a].auto_wall.x), 8);
-                    file.read(reinterpret_cast<char*>(&bp.anchors[a].auto_wall.y), 8);
-                    file.read(reinterpret_cast<char*>(&bp.anchors[a].auto_wall.width), 8);
-                    file.read(reinterpret_cast<char*>(&bp.anchors[a].auto_wall.height), 8);
-                    bp.anchors[a].auto_wall.user_data = 0;
-                } else {
-                    bp.anchors[a].auto_wall = {0, 0, 0, 0, 0};
+                    int64_t dummy_auto_wall[4];
+                    file.read(reinterpret_cast<char*>(dummy_auto_wall), 32);
                 }
             }
 
             if (version >= 2) {
                 uint32_t poly_count;
                 file.read(reinterpret_cast<char*>(&poly_count), 4);
-                bp.polygons.resize(poly_count);
                 for (uint32_t p = 0; p < poly_count; ++p) {
                     uint32_t v_count;
                     file.read(reinterpret_cast<char*>(&v_count), 4);
                     
                     int64_t xy[2];
                     file.read(reinterpret_cast<char*>(xy), 16);
-                    bp.polygons[p].x = xy[0];
-                    bp.polygons[p].y = xy[1];
-                    
-                    bp.polygons[p].vx.resize(v_count);
-                    bp.polygons[p].vy.resize(v_count);
-                    
-                    int64_t min_x = 0x7FFFFFFFFFFFFFFF; int64_t min_y = 0x7FFFFFFFFFFFFFFF;
-                    int64_t max_x = -0x7FFFFFFFFFFFFFFF; int64_t max_y = -0x7FFFFFFFFFFFFFFF;
                     
                     for (uint32_t v = 0; v < v_count; ++v) {
                         int64_t vxy[2];
                         file.read(reinterpret_cast<char*>(vxy), 16);
-                        bp.polygons[p].vx[v] = vxy[0];
-                        bp.polygons[p].vy[v] = vxy[1];
-                        if (vxy[0] < min_x) min_x = vxy[0]; if (vxy[0] > max_x) max_x = vxy[0];
-                        if (vxy[1] < min_y) min_y = vxy[1]; if (vxy[1] > max_y) max_y = vxy[1];
                     }
-                    bp.polygons[p].bounds.x = xy[0] + min_x;
-                    bp.polygons[p].bounds.y = xy[1] + min_y;
-                    bp.polygons[p].bounds.width = max_x - min_x;
-                    bp.polygons[p].bounds.height = max_y - min_y;
-                    bp.polygons[p].user_data = 0;
-                    bp.polygons[p].bounds.user_data = 0;
                 }
             }
 

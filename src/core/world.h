@@ -1,18 +1,16 @@
 #pragma once
 #include "entity.h"
-#include "shapes.h"
 #include "input.h"
 #include "ecs.h"
-#include "entity_grid.h"
-#include "static_wall_grid.h"
 #include "rng.h"
 #include "tile_registry.h"
-#include "map_generator.h"
 #include "hydrology_graph.h"
+#include "tectonic_heightmap.h"
 #include <vector>
 #include <unordered_set>
 #include <cstdint>
 #include <memory>
+#include <cstring>
 
 enum class WeatherState : uint8_t {
     CLEAR = 0,
@@ -91,7 +89,6 @@ public:
     
     void load_tile_registry(const std::string& path) { _tile_registry.load_from_file(path); }
     const TileRegistry& get_tile_registry() const { return _tile_registry; }
-    const Generation::MapGenerator* get_last_generator() const { return _last_generator.get(); }
 
 
     void set_seed(uint64_t seed);
@@ -107,30 +104,7 @@ public:
     void equip_item(EntityID entity_id, int slot, uint64_t item_id);
     void unequip_item(EntityID entity_id, int slot);
 
-    void add_wall(int64_t x, int64_t y, int64_t w, int64_t h);
-    void generate_map_cellular_automata(uint64_t seed, int64_t width, int64_t height, int64_t cell_size_fixed, int32_t iterations = 5, int32_t fill_prob = 45);
     void generate_player_map(uint64_t seed, int64_t width, int64_t height, int64_t cell_size_fixed);
-    void clear_walls();
-    void finalize_walls();
-    const std::vector<SimAABB>& get_walls() const { return _walls; }
-
-    void add_polygon(int64_t x, int64_t y, const std::vector<int64_t>& vx, const std::vector<int64_t>& vy) {
-        SimPolygon poly;
-        poly.x = x; poly.y = y; poly.vx = vx; poly.vy = vy; poly.user_data = 0;
-        int64_t min_x = 0x7FFFFFFFFFFFFFFF; int64_t min_y = 0x7FFFFFFFFFFFFFFF;
-        int64_t max_x = -0x7FFFFFFFFFFFFFFF; int64_t max_y = -0x7FFFFFFFFFFFFFFF;
-        for(size_t i=0; i<vx.size(); ++i) {
-            if(vx[i] < min_x) min_x = vx[i]; if(vx[i] > max_x) max_x = vx[i];
-            if(vy[i] < min_y) min_y = vy[i]; if(vy[i] > max_y) max_y = vy[i];
-        }
-        poly.bounds.x = x + min_x; poly.bounds.y = y + min_y;
-        poly.bounds.width = max_x - min_x; poly.bounds.height = max_y - min_y;
-        poly.bounds.user_data = 0;
-        _polygons.push_back(poly);
-    }
-    void clear_polygons() { _polygons.clear(); }
-    const std::vector<SimPolygon>& get_polygons() const { return _polygons; }
-    void finalize_polygons() { _poly_grid.build_polygons(_polygons); }
 
     void clear_entities();
 
@@ -170,6 +144,10 @@ public:
         _soil_magnesium.assign(total_cells, 0);
         _soil_sulfur.assign(total_cells, 0);
         _soil_compactness.assign(total_cells, 0);
+        _water_table.assign(total_cells, 0);
+        _aquifers.assign(total_cells, 0);
+        _rivers.assign(total_cells, 0);
+        _flow_targets.assign(total_cells, -1);
         _lakes.assign(total_cells, 0);
         _structure_type.assign(total_cells, 0);
         _water_pressure.assign(total_cells, 0);
@@ -200,7 +178,6 @@ public:
     void set_mineral_type(const std::vector<uint8_t>& m) { _mineral_type = m; }
     void set_starter_spawn(int32_t x, int32_t y) { _starter_spawn_x = x; _starter_spawn_y = y; }
     void set_starter_pond(int64_t cur, int64_t max) { _starter_pond_volume = cur; _starter_pond_max = max; }
-    void set_hydraulic_graph(const Hydrology::HydraulicGraph& hg) { _hydraulic_graph = hg; }
     void set_chunk_tiers(const std::vector<uint8_t>& t) { _chunk_tiers = t; }
     void set_soil_nitrogen(const std::vector<int32_t>& n) { _soil_nitrogen = n; }
     void set_soil_phosphorus(const std::vector<int32_t>& p) { _soil_phosphorus = p; }
@@ -237,6 +214,7 @@ public:
     int32_t get_starter_spawn_y() const { return _starter_spawn_y; }
     int64_t get_starter_pond_volume() const { return _starter_pond_volume; }
     int64_t get_starter_pond_max() const { return _starter_pond_max; }
+    void set_hydraulic_graph(const Hydrology::HydraulicGraph& hg) { _hydraulic_graph = hg; }
     const Hydrology::HydraulicGraph& get_hydraulic_graph() const { return _hydraulic_graph; }
     Hydrology::HydraulicGraph& get_hydraulic_graph_mut() { return _hydraulic_graph; }
     const std::vector<uint8_t>& get_chunk_tiers() const { return _chunk_tiers; }
@@ -254,9 +232,12 @@ public:
     const std::vector<uint8_t>& get_crop_suffix() const { return _crop_suffix; }
     const std::vector<uint8_t>& get_crop_implicit() const { return _crop_implicit; }
     const std::vector<int32_t>& get_planted_tile_indices() const { return _planted_tile_indices; }
+    const Tectonics::ContinuousTectonicHeightmap& get_tectonic_heightmap() const { return _tectonic_heightmap; }
+    Tectonics::ContinuousTectonicHeightmap& get_tectonic_heightmap_mut() { return _tectonic_heightmap; }
+    const Tectonics::ContinuousTectonicHeightmap::Config& get_tectonic_config() const { return _tectonic_config; }
+    Tectonics::ContinuousTectonicHeightmap::Config& get_tectonic_config_mut() { return _tectonic_config; }
+    void set_tectonic_config(const Tectonics::ContinuousTectonicHeightmap::Config& cfg) { _tectonic_config = cfg; }
 
-    EntityGrid& get_grid_mut() { return _entity_grid; }
-    const EntityGrid& get_grid() const { return _entity_grid; }
 
     static std::vector<uint8_t> serialize_snapshot(const BisectSnapshot &snap);
     static const uint8_t*       deserialize_snapshot(BisectSnapshot &snap, const uint8_t *ptr);
@@ -314,9 +295,6 @@ public:
 
     // ---- SYSTEMS ----
     EntityContainer _entities;
-    EntityGrid _entity_grid;
-    StaticWallGrid  _wall_grid;
-    StaticWallGrid  _poly_grid;
 
     int32_t _last_player_cx = -999;
     int32_t _last_player_cy = -999;
@@ -324,11 +302,8 @@ public:
     // ---- DATA ----
     std::vector<EntityID> _entity_recycle_bin; // IDs available for reuse
     std::vector<EntityID> _attack_recycle_bin;
-    std::vector<SimAABB> _walls;
-    std::vector<SimPolygon> _polygons;
     
     TileRegistry _tile_registry;
-    std::unique_ptr<Generation::MapGenerator> _last_generator;
 
     uint64_t _shotgun_seed = 0;
     uint64_t _tornado_seed = 0;
@@ -387,4 +362,6 @@ public:
     int64_t              _starter_pond_volume = 0;
     int64_t              _starter_pond_max = 0;
     Hydrology::HydraulicGraph _hydraulic_graph;
+    Tectonics::ContinuousTectonicHeightmap _tectonic_heightmap;
+    Tectonics::ContinuousTectonicHeightmap::Config _tectonic_config;
 };

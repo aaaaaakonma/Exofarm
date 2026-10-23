@@ -2,30 +2,24 @@
 import os
 import sys
 
+# Default configuration for godot-cpp: Godot 4.7 API and LLVM/Clang
+ARGUMENTS.setdefault("api_version", "4.7")
+ARGUMENTS.setdefault("use_llvm", "yes")
+Export(api_version=ARGUMENTS.get("api_version", "4.7"))
+
 # Load the SConscript from godot-cpp
 # This will return the environment configured by godot-cpp
 env = SConscript("godot-cpp/SConstruct")
 
 # MSVC on Windows, GCC/Clang on others, with optimized flags
 if env["platform"] == "windows":
-    # MSVC: High optimization, with LTO
-    env.Append(CCFLAGS=[
-        "/O2",       # Maximize Speed
-        "/Ob2",      # Inline Any Suitable
-        "/Oi",       # Enable Intrinsic Functions
-        "/Ot",       # Favor Fast Code
-        "/Oy",       # Omit Frame Pointers
-        "/fp:fast",  # Fast floating point behavior (MSVC's -ffast-math)
-        "/Qfast_transcendentals", # Generates inline code for transcendental functions
-        "/GL",       # Whole Program Optimization
-        "/GF",       # Eliminate Duplicate Strings
-        "/Gy",       # Enable Function-Level Linking
-        "/Gw",       # Optimize Global Data
-        "/arch:AVX2", # Use AVX2 instructions
-        "/DNDEBUG"   # Disable assertions
-    ])
-    env.Append(CXXFLAGS=["/vmg", "/std:c++17", "/EHsc"])
-    env.Append(LINKFLAGS=["/DEBUG", "/LTCG"])
+    if env.get("is_msvc", False):
+        env.Append(CCFLAGS=["/O2", "/Ob2", "/Oi", "/Ot", "/Oy", "/fp:fast", "/arch:AVX2", "/DNDEBUG"])
+        env.Append(CXXFLAGS=["/std:c++17", "/EHsc"])
+        env.Append(LINKFLAGS=["/DEBUG"])
+    else:
+        env.Append(CCFLAGS=["-O3", "-ffast-math", "-mavx2", "-DNDEBUG", "-fvisibility=hidden"])
+        env.Append(CXXFLAGS=["-std=c++20"])
 else:
     # GCC/Clang for Linux/macOS
     env.Append(CCFLAGS=[
@@ -62,6 +56,8 @@ env.Append(CPPPATH=cpp_paths)
 # We include all .cpp files recursively in the src directory
 sources = []
 for root, dirs, files in os.walk(src_dir):
+    if "tests" in root:
+        continue
     for f in files:
         if f.endswith(".cpp"):
             sources.append(os.path.join(root, f).replace('\\', '/'))
@@ -107,6 +103,8 @@ Default(library)
 # These use the SIM_HEADLESS define to strip Godot dependencies.
 headless_env = env.Clone()
 headless_env.Append(CPPDEFINES=["SIM_HEADLESS"])
+if not env.get("is_msvc", False):
+    headless_env.Append(CXXFLAGS=["-fexceptions"])
 
 headless_env.Prepend(CPPPATH=["."]) 
 
@@ -127,3 +125,10 @@ hydrology_test = headless_env.Program(
     source="test_hydrology.cpp"
 )
 Alias("hydrology", hydrology_test)
+
+tectonics_test = headless_env.Program(
+    target="bin/test_tectonics",
+    source="test_tectonics.cpp"
+)
+Alias("tectonics", tectonics_test)
+

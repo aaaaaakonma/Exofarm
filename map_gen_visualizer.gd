@@ -65,12 +65,26 @@ var tick_counter: int = 0
 
 # UI Controls
 var seed_spin: SpinBox
-var plates_min_spin: SpinBox
-var plates_max_spin: SpinBox
-var center_bias_spin: SpinBox
-var cont_chance_spin: SpinBox
-var vel_min_spin: SpinBox
-var vel_max_spin: SpinBox
+var num_plates_spin: SpinBox
+var continent_chance_spin: SpinBox
+var island_arc_chance_spin: SpinBox
+var warp_scale_spin: SpinBox
+var fold_belt_width_spin: SpinBox
+
+var collision_uplift_spin: SpinBox
+var subduction_arc_spin: SpinBox
+var subduction_trench_spin: SpinBox
+var rift_graben_spin: SpinBox
+var rift_shoulder_spin: SpinBox
+var cont_base_elev_spin: SpinBox
+var ocean_base_elev_spin: SpinBox
+var coastal_boundary_elev_spin: SpinBox
+var shelf_width_spin: SpinBox
+var shelf_depth_spin: SpinBox
+
+var detail_noise_spin: SpinBox
+var noise_octaves_spin: SpinBox
+
 var mode_opt: OptionButton
 var view_btn: Button
 var cam_btn: Button
@@ -89,6 +103,7 @@ func _ready() -> void:
 	add_child(camera)
 	
 	_setup_ui()
+	_load_config_into_ui(bridge.get_config())
 	generate_new_map(current_seed)
 	focus_on_spawn()
 
@@ -107,6 +122,29 @@ func _create_section_header(title_text: String) -> Control:
 	container.add_child(lbl)
 	
 	return container
+
+func _create_spin_row(parent: VBoxContainer, label_text: String, min_v: float, max_v: float, step_v: float, default_v: float) -> SpinBox:
+	var hb = HBoxContainer.new()
+	var lbl = Label.new()
+	lbl.text = label_text
+	lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var spin = SpinBox.new()
+	spin.min_value = min_v
+	spin.max_value = max_v
+	spin.step = step_v
+	spin.value = default_v
+	spin.custom_minimum_size = Vector2(90, 0)
+	hb.add_child(lbl)
+	hb.add_child(spin)
+	parent.add_child(hb)
+	return spin
+
+func _create_check_row(parent: VBoxContainer, label_text: String, default_v: bool) -> CheckBox:
+	var chk = CheckBox.new()
+	chk.text = label_text
+	chk.button_pressed = default_v
+	parent.add_child(chk)
+	return chk
 
 func _setup_ui() -> void:
 	var canvas = CanvasLayer.new()
@@ -206,86 +244,105 @@ func _setup_ui() -> void:
 	vbox.add_child(seed_btn_row)
 	
 	# -------------------------------------------------------------
-	# 3. Tectonic Configuration
+	# 3. Tectonic Plates & Warping
 	# -------------------------------------------------------------
-	vbox.add_child(_create_section_header("TECTONIC CONFIGURATION"))
-	
-	var hb1 = HBoxContainer.new()
-	var l1 = Label.new(); l1.text = "Plates Min:"
-	plates_min_spin = SpinBox.new(); plates_min_spin.min_value = 1; plates_min_spin.max_value = 50; plates_min_spin.value = 4
-	plates_min_spin.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	hb1.add_child(l1); hb1.add_child(plates_min_spin)
-	vbox.add_child(hb1)
-	
-	var hb2 = HBoxContainer.new()
-	var l2 = Label.new(); l2.text = "Plates Max:"
-	plates_max_spin = SpinBox.new(); plates_max_spin.min_value = 1; plates_max_spin.max_value = 50; plates_max_spin.value = 7
-	plates_max_spin.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	hb2.add_child(l2); hb2.add_child(plates_max_spin)
-	vbox.add_child(hb2)
-	
-	var hb3 = HBoxContainer.new()
-	var l3 = Label.new(); l3.text = "Center Bias %:"
-	center_bias_spin = SpinBox.new(); center_bias_spin.min_value = 0; center_bias_spin.max_value = 100; center_bias_spin.value = 85
-	center_bias_spin.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	hb3.add_child(l3); hb3.add_child(center_bias_spin)
-	vbox.add_child(hb3)
-	
-	var hb4 = HBoxContainer.new()
-	var l4 = Label.new(); l4.text = "Continent %:"
-	cont_chance_spin = SpinBox.new(); cont_chance_spin.min_value = 0; cont_chance_spin.max_value = 100; cont_chance_spin.value = 70
-	cont_chance_spin.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	hb4.add_child(l4); hb4.add_child(cont_chance_spin)
-	vbox.add_child(hb4)
-	
-	var hb5 = HBoxContainer.new()
-	var l5 = Label.new(); l5.text = "Velocity Min:"
-	vel_min_spin = SpinBox.new(); vel_min_spin.min_value = 0.1; vel_min_spin.max_value = 10.0; vel_min_spin.step = 0.1; vel_min_spin.value = 0.5
-	vel_min_spin.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	hb5.add_child(l5); hb5.add_child(vel_min_spin)
-	vbox.add_child(hb5)
-	
-	var hb6 = HBoxContainer.new()
-	var l6 = Label.new(); l6.text = "Velocity Max:"
-	vel_max_spin = SpinBox.new(); vel_max_spin.min_value = 0.1; vel_max_spin.max_value = 10.0; vel_max_spin.step = 0.1; vel_max_spin.value = 3.0
-	vel_max_spin.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	hb6.add_child(l6); hb6.add_child(vel_max_spin)
-	vbox.add_child(hb6)
-	
-	var apply_tectonics_btn = Button.new()
-	apply_tectonics_btn.text = "Apply Tectonics & Generate"
-	apply_tectonics_btn.pressed.connect(self._on_generate_pressed)
-	vbox.add_child(apply_tectonics_btn)
-	
+	vbox.add_child(_create_section_header("TECTONIC PLATES & WARPING"))
+	num_plates_spin = _create_spin_row(vbox, "Plates Count:", 2, 40, 1, 14)
+	continent_chance_spin = _create_spin_row(vbox, "Continent %:", 0, 100, 1, 60)
+	island_arc_chance_spin = _create_spin_row(vbox, "Island Arc %:", 0, 100, 1, 15)
+	warp_scale_spin = _create_spin_row(vbox, "Domain Warp Scale:", 0, 150, 1, 75)
+	fold_belt_width_spin = _create_spin_row(vbox, "Fold Belt Width:", 10, 100, 1, 40)
+
 	# -------------------------------------------------------------
-	# 4. Continental Presets
+	# 4. Orogeny & Mountain Elevation
+	# -------------------------------------------------------------
+	vbox.add_child(_create_section_header("OROGENY & MOUNTAINS"))
+	collision_uplift_spin = _create_spin_row(vbox, "Collision Uplift:", 0, 80, 1, 38)
+	subduction_arc_spin = _create_spin_row(vbox, "Volcanic Arc Peak:", 0, 60, 1, 24)
+	subduction_trench_spin = _create_spin_row(vbox, "Trench Depth:", 0, 60, 1, 22)
+	rift_graben_spin = _create_spin_row(vbox, "Rift Graben Depth:", 0, 50, 1, 22)
+	rift_shoulder_spin = _create_spin_row(vbox, "Rift Shoulder:", 0, 30, 1, 12)
+	cont_base_elev_spin = _create_spin_row(vbox, "Continental Base Elev:", 0, 50, 1, 26)
+	ocean_base_elev_spin = _create_spin_row(vbox, "Oceanic Base Elev:", -60, 0, 1, -36)
+	coastal_boundary_elev_spin = _create_spin_row(vbox, "Coast Boundary Elev:", -10, 10, 0.5, 2.0)
+	shelf_width_spin = _create_spin_row(vbox, "Shelf Width:", 10, 150, 5, 36)
+	shelf_depth_spin = _create_spin_row(vbox, "Shelf Depth:", -30, 0, 1, -8)
+
+	# -------------------------------------------------------------
+	# 5. Terrain Detail & Noise
+	# -------------------------------------------------------------
+	vbox.add_child(_create_section_header("TERRAIN DETAIL & NOISE"))
+	detail_noise_spin = _create_spin_row(vbox, "Detail Noise Scale:", 0, 30, 0.5, 14.0)
+	noise_octaves_spin = _create_spin_row(vbox, "Noise Octaves:", 1, 8, 1, 6)
+
+	var apply_knobs_btn = Button.new()
+	apply_knobs_btn.text = "Apply Parameters & Generate [Space]"
+	apply_knobs_btn.pressed.connect(self._on_generate_pressed)
+	vbox.add_child(apply_knobs_btn)
+
+	# -------------------------------------------------------------
+	# 6. Continental Presets
 	# -------------------------------------------------------------
 	vbox.add_child(_create_section_header("CONTINENTAL PRESETS"))
-	
-	var preset_standard_btn = Button.new()
-	preset_standard_btn.text = "Preset: Major Continents (70% Land)"
-	preset_standard_btn.pressed.connect(func(): _apply_preset(4, 7, 85, 70, 0.5, 3.0))
-	vbox.add_child(preset_standard_btn)
-	
+
+	var preset_std_btn = Button.new()
+	preset_std_btn.text = "Preset: Major Continents (Default)"
+	preset_std_btn.pressed.connect(func(): _apply_preset({
+		"num_plates": 14, "continent_chance": 60, "island_arc_chance": 15,
+		"warp_scale": 75.0, "fold_belt_width": 40.0, "collision_uplift": 38.0,
+		"subduction_arc": 24.0, "subduction_trench": 22.0, "detail_noise_scale": 14.0
+	}))
+	vbox.add_child(preset_std_btn)
+
+	var preset_alpine_btn = Button.new()
+	preset_alpine_btn.text = "Preset: Alpine Orogeny & Peaks"
+	preset_alpine_btn.pressed.connect(func(): _apply_preset({
+		"num_plates": 16, "continent_chance": 75, "island_arc_chance": 10,
+		"warp_scale": 85.0, "fold_belt_width": 50.0, "collision_uplift": 55.0,
+		"subduction_arc": 32.0, "subduction_trench": 26.0, "detail_noise_scale": 18.0
+	}))
+	vbox.add_child(preset_alpine_btn)
+
 	var preset_pangea_btn = Button.new()
-	preset_pangea_btn.text = "Preset: Pangea Supercontinent (88% Land)"
-	preset_pangea_btn.pressed.connect(func(): _apply_preset(2, 4, 95, 90, 0.8, 4.0))
+	preset_pangea_btn.text = "Preset: Pangea Supercontinent"
+	preset_pangea_btn.pressed.connect(func(): _apply_preset({
+		"num_plates": 8, "continent_chance": 88, "island_arc_chance": 5,
+		"warp_scale": 95.0, "fold_belt_width": 55.0, "collision_uplift": 45.0,
+		"subduction_arc": 28.0, "subduction_trench": 22.0, "detail_noise_scale": 16.0
+	}))
 	vbox.add_child(preset_pangea_btn)
-	
-	var preset_highlands_btn = Button.new()
-	preset_highlands_btn.text = "Preset: Dense Highlands (80% Land)"
-	preset_highlands_btn.pressed.connect(func(): _apply_preset(3, 5, 90, 85, 1.5, 4.5))
-	vbox.add_child(preset_highlands_btn)
-	
-	var preset_inland_btn = Button.new()
-	preset_inland_btn.text = "Preset: Inland Sea / Ring Land"
-	preset_inland_btn.pressed.connect(func(): _apply_preset(4, 6, 25, 75, 0.3, 2.0))
-	vbox.add_child(preset_inland_btn)
-	
+
 	var preset_islands_btn = Button.new()
-	preset_islands_btn.text = "Preset: Archipelago & Islands (40% Land)"
-	preset_islands_btn.pressed.connect(func(): _apply_preset(10, 18, 50, 40, 0.5, 2.5))
+	preset_islands_btn.text = "Preset: Volcanic Archipelago"
+	preset_islands_btn.pressed.connect(func(): _apply_preset({
+		"num_plates": 24, "continent_chance": 30, "island_arc_chance": 40,
+		"warp_scale": 90.0, "fold_belt_width": 30.0, "collision_uplift": 25.0,
+		"subduction_arc": 32.0, "subduction_trench": 30.0, "detail_noise_scale": 14.0
+	}))
 	vbox.add_child(preset_islands_btn)
+
+	var preset_lowlands_btn = Button.new()
+	preset_lowlands_btn.text = "Preset: Rolling Lowlands & Hills"
+	preset_lowlands_btn.pressed.connect(func(): _apply_preset({
+		"num_plates": 10, "continent_chance": 65, "island_arc_chance": 10,
+		"warp_scale": 55.0, "fold_belt_width": 45.0, "collision_uplift": 18.0,
+		"subduction_arc": 14.0, "subduction_trench": 16.0, "detail_noise_scale": 10.0
+	}))
+	vbox.add_child(preset_lowlands_btn)
+
+	var preset_rifts_btn = Button.new()
+	preset_rifts_btn.text = "Preset: Deep Rifts & Canyons"
+	preset_rifts_btn.pressed.connect(func(): _apply_preset({
+		"num_plates": 16, "continent_chance": 65, "island_arc_chance": 15,
+		"warp_scale": 80.0, "fold_belt_width": 40.0, "rift_graben": 36.0,
+		"rift_shoulder": 20.0, "subduction_trench": 32.0, "detail_noise_scale": 16.0
+	}))
+	vbox.add_child(preset_rifts_btn)
+
+	var reset_knobs_btn = Button.new()
+	reset_knobs_btn.text = "Reset Knobs to Engine Defaults"
+	reset_knobs_btn.pressed.connect(func(): _load_config_into_ui(bridge.get_config()))
+	vbox.add_child(reset_knobs_btn)
 	
 	# -------------------------------------------------------------
 	# 5. Display Layers & Modes
@@ -344,6 +401,11 @@ func _setup_ui() -> void:
 	# -------------------------------------------------------------
 	vbox.add_child(_create_section_header("SWITCH SCENE"))
 	
+	var scene_3d_btn = Button.new()
+	scene_3d_btn.text = "Open 3D Tectonics & Wave Visualizer"
+	scene_3d_btn.pressed.connect(func(): get_tree().change_scene_to_file("res://world_3d_visualizer.tscn"))
+	vbox.add_child(scene_3d_btn)
+
 	var micro_scene_btn = Button.new()
 	micro_scene_btn.text = "Open Ground River Visualizer"
 	micro_scene_btn.pressed.connect(func(): get_tree().change_scene_to_file("res://river_micro_visualizer.tscn"))
@@ -360,17 +422,57 @@ func _setup_ui() -> void:
 	vbox.add_child(_create_section_header("CONTROLS"))
 	
 	var help_lbl = Label.new()
-	help_lbl.text = "[WASD / Arrows] Move Player\n[I, J, K, L] Freecam Pan\n[M] Toggle World Map\n[1..5] Select Layer Mode\n[G] Toggle Tile Grid\n[C] Toggle Camera Mode\n[F] Center on Spawn\n[R] Random Seed\n[Mouse Wheel] Zoom Map"
+	help_lbl.text = "[Space] Generate / Apply Knobs\n[WASD / Arrows] Move Player\n[I, J, K, L] Freecam Pan\n[M] Toggle World Map\n[1..5] Select Layer Mode\n[G] Toggle Tile Grid\n[C] Toggle Camera Mode\n[F] Center on Spawn\n[R] Random Seed\n[Mouse Wheel] Zoom Map"
 	help_lbl.add_theme_color_override("font_color", Color(0.70, 0.75, 0.80))
 	vbox.add_child(help_lbl)
 
-func _apply_preset(p_min: int, p_max: int, center_bias: int, cont_chance: int, v_min: float = 0.5, v_max: float = 3.0) -> void:
-	if plates_min_spin: plates_min_spin.value = p_min
-	if plates_max_spin: plates_max_spin.value = p_max
-	if center_bias_spin: center_bias_spin.value = center_bias
-	if cont_chance_spin: cont_chance_spin.value = cont_chance
-	if vel_min_spin: vel_min_spin.value = v_min
-	if vel_max_spin: vel_max_spin.value = v_max
+func get_ui_config() -> Dictionary:
+	var cfg = {}
+	cfg["seed"] = current_seed
+	if num_plates_spin: cfg["num_plates"] = int(num_plates_spin.value)
+	if continent_chance_spin: cfg["continent_chance"] = int(continent_chance_spin.value)
+	if island_arc_chance_spin: cfg["island_arc_chance"] = int(island_arc_chance_spin.value)
+	if warp_scale_spin: cfg["warp_scale"] = float(warp_scale_spin.value)
+	if fold_belt_width_spin: cfg["fold_belt_width"] = float(fold_belt_width_spin.value)
+	if collision_uplift_spin: cfg["collision_uplift"] = float(collision_uplift_spin.value)
+	if subduction_arc_spin: cfg["subduction_arc"] = float(subduction_arc_spin.value)
+	if subduction_trench_spin: cfg["subduction_trench"] = float(subduction_trench_spin.value)
+	if rift_graben_spin: cfg["rift_graben"] = float(rift_graben_spin.value)
+	if rift_shoulder_spin: cfg["rift_shoulder"] = float(rift_shoulder_spin.value)
+	if cont_base_elev_spin: cfg["continental_base_elevation"] = float(cont_base_elev_spin.value)
+	if ocean_base_elev_spin: cfg["oceanic_base_elevation"] = float(ocean_base_elev_spin.value)
+	if coastal_boundary_elev_spin: cfg["coastal_boundary_elevation"] = float(coastal_boundary_elev_spin.value)
+	if shelf_width_spin: cfg["shelf_width"] = float(shelf_width_spin.value)
+	if shelf_depth_spin: cfg["shelf_depth"] = float(shelf_depth_spin.value)
+	if detail_noise_spin: cfg["detail_noise_scale"] = float(detail_noise_spin.value)
+	if noise_octaves_spin: cfg["noise_octaves"] = int(noise_octaves_spin.value)
+	
+	return cfg
+
+func _load_config_into_ui(dict: Dictionary) -> void:
+	if dict.is_empty():
+		return
+	if dict.has("num_plates") and num_plates_spin: num_plates_spin.value = dict["num_plates"]
+	if dict.has("continent_chance") and continent_chance_spin: continent_chance_spin.value = dict["continent_chance"]
+	if dict.has("island_arc_chance") and island_arc_chance_spin: island_arc_chance_spin.value = dict["island_arc_chance"]
+	if dict.has("warp_scale") and warp_scale_spin: warp_scale_spin.value = dict["warp_scale"]
+	if dict.has("fold_belt_width") and fold_belt_width_spin: fold_belt_width_spin.value = dict["fold_belt_width"]
+	if dict.has("collision_uplift") and collision_uplift_spin: collision_uplift_spin.value = dict["collision_uplift"]
+	if dict.has("subduction_arc") and subduction_arc_spin: subduction_arc_spin.value = dict["subduction_arc"]
+	if dict.has("subduction_trench") and subduction_trench_spin: subduction_trench_spin.value = dict["subduction_trench"]
+	if dict.has("rift_graben") and rift_graben_spin: rift_graben_spin.value = dict["rift_graben"]
+	if dict.has("rift_shoulder") and rift_shoulder_spin: rift_shoulder_spin.value = dict["rift_shoulder"]
+	if dict.has("continental_base_elevation") and cont_base_elev_spin: cont_base_elev_spin.value = dict["continental_base_elevation"]
+	if dict.has("oceanic_base_elevation") and ocean_base_elev_spin: ocean_base_elev_spin.value = dict["oceanic_base_elevation"]
+	if dict.has("coastal_boundary_elevation") and coastal_boundary_elev_spin: coastal_boundary_elev_spin.value = dict["coastal_boundary_elevation"]
+	if dict.has("shelf_width") and shelf_width_spin: shelf_width_spin.value = dict["shelf_width"]
+	if dict.has("shelf_depth") and shelf_depth_spin: shelf_depth_spin.value = dict["shelf_depth"]
+	if dict.has("detail_noise_scale") and detail_noise_spin: detail_noise_spin.value = dict["detail_noise_scale"]
+	if dict.has("noise_octaves") and noise_octaves_spin: noise_octaves_spin.value = dict["noise_octaves"]
+	
+
+func _apply_preset(preset_dict: Dictionary) -> void:
+	_load_config_into_ui(preset_dict)
 	generate_new_map(current_seed)
 
 func _on_random_seed_pressed() -> void:
@@ -402,19 +504,12 @@ func _on_cycle_mode_pressed() -> void:
 
 func generate_new_map(seed_val: int) -> void:
 	current_seed = seed_val
-	bridge.set_seed(current_seed)
+	if seed_spin:
+		seed_spin.value = current_seed
 	
-	if plates_min_spin != null:
-		var v_min = int(vel_min_spin.value * 100.0) if vel_min_spin else 50
-		var v_max = int(vel_max_spin.value * 100.0) if vel_max_spin else 300
-		bridge.set_tectonic_config(
-			int(plates_min_spin.value),
-			int(plates_max_spin.value),
-			int(center_bias_spin.value),
-			int(cont_chance_spin.value),
-			v_min,
-			v_max
-		)
+	var cfg = get_ui_config()
+	cfg["seed"] = current_seed
+	bridge.set_config(cfg)
 	
 	bridge.generate_player_map(current_seed, 256, 144, 64 * 65536)
 	
@@ -712,6 +807,8 @@ func _unhandled_input(event: InputEvent) -> void:
 			focus_on_spawn()
 		elif event.keycode == KEY_R:
 			_on_random_seed_pressed()
+		elif event.keycode == KEY_SPACE:
+			_on_generate_pressed()
 	elif event is InputEventMouseButton:
 		if event.button_index == MOUSE_BUTTON_WHEEL_UP:
 			var new_z = clamp(camera.zoom.x * 1.15, 0.15, 4.0)

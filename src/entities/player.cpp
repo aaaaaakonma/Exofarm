@@ -19,7 +19,7 @@ void Player::tick(EntityID id, const InputFrame &input, SimWorld &world) {
     world.get_chaos_mut().flags[world.get_dense_idx(id)] |= (uint8_t)EntityFlags::DIRTY;
 }
 
-#include "map_generator.h"
+
 
 void Player::handle_movement(EntityID id, const InputFrame &input, SimWorld &world) {
     uint32_t idx = world.get_dense_idx(id);

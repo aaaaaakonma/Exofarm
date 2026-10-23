@@ -81,9 +81,16 @@ inline int64_t inv_sqrt_fixed(int64_t x) {
     return res;
 }
 
+// Normalize an angle (16.16 radians) into [-PI, PI] in O(1) using integer modular arithmetic.
+// Q3 FIX: the previous while-loop was O(|angle| / TWO_PI), which could iterate thousands of
+// times for large accumulated angles (e.g. from velocity integration). This version is O(1)
+// and deterministic regardless of input magnitude.
 inline int64_t normalize_angle(int64_t angle) {
-    while (angle > PI_FIXED) angle -= TWO_PI;
-    while (angle < -PI_FIXED) angle += TWO_PI;
+    // Reduce modulo TWO_PI into [0, TWO_PI)
+    angle = angle % TWO_PI;
+    // Shift into [-PI, PI]
+    if (angle > PI_FIXED)  angle -= TWO_PI;
+    if (angle < -PI_FIXED) angle += TWO_PI;
     return angle;
 }
 

@@ -10,12 +10,7 @@
 
 #include "src/core/world.cpp"
 #include "src/core/item.cpp"
-#include "src/core/collision.cpp"
-#include "src/math/cordic.cpp"
-#include "src/core/map_generator.cpp"
 #include "src/entities/player.cpp"
-#include "src/entities/enemy.cpp"
-#include "src/entities/wall.cpp"
 
 void test_direct_hydrology_graph() {
     std::cout << "--- Testing HydraulicGraph Direct Pipe & Reservoir Model ---" << std::endl;
