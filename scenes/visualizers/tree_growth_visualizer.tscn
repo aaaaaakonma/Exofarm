@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://buctykpbl2twa"]
+
+[ext_resource type="Script" path="res://scenes/visualizers/tree_growth_visualizer.gd" id="1_tree_vis"]
+
+[node name="TreeGrowthVisualizer" type="Node3D"]
+script = ExtResource("1_tree_vis")

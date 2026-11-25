@@ -99,6 +99,8 @@ public:
                     std::vector<char> name_buf(name_len);
                     file.read(name_buf.data(), name_len);
                     bp.type_name = std::string(name_buf.data(), name_len);
+                } else if (name_len >= 1024) {
+                    file.seekg(name_len, std::ios::cur);
                 }
                 file.read(reinterpret_cast<char*>(&bp.type_hash), 8);
             } else {

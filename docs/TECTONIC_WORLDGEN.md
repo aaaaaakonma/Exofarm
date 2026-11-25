@@ -32,11 +32,11 @@ struct TectonicNode {
     uint32_t id;
     Vec2Fixed position;        // World coordinates (16.16)
     Vec2Fixed velocity;        // Drift velocity vector (16.16)
-    PlateType plate_type;      // CONTINENTAL, OCEANIC, ISLAND_ARC
+    PlateType plate_type;      // CONTINENTAL (oceanic distinction removed for seamless terrain)
     int64_t base_elevation;    // Macro crust elevation (16.16)
     int64_t crust_thickness;   // Lithosphere thickness (affects deformation width)
     int64_t crust_rigidity;    // Flexural rigidity (affects fold wavelength)
-    int64_t density;           // Density (e.g. 2700 cont vs 3000 oceanic)
+    int64_t density;           // Continental crust density (2700)
     int64_t roughness;         // Meso-scale roughness multiplier
 };
 ```
@@ -44,11 +44,22 @@ struct TectonicNode {
 ### 1.2 Mitchell's Best-Candidate Plate Distribution
 
 To prevent unnatural clustering of plate centers while avoiding the artificial regularity of strict grid distribution, the engine uses **Mitchell's Best-Candidate Algorithm** ([`generate_control_nodes`](file:///E:/exofarm/exofarm/src/core/tectonic_heightmap.h#L204-L326)):
-1. Plate 0 is placed near the world center with a continental bias to guarantee an accessible starter landmass for the player.
+1. Plate 0 is placed near the world center to anchor a starter region for the player.
 2. For each subsequent plate $i \in [1, N-1]$, $k$ candidate positions are sampled uniformly at random across the map.
 3. The candidate that maximizes the minimum squared Euclidean distance to all previously placed plates is selected:
    $$\text{cand}^* = \arg\max_{c \in C} \min_{p \in P} \|c - p\|^2$$
-4. 8 surrounding buffer oceanic plates are positioned beyond the world boundary (4 midpoints and 4 corners), guaranteeing that all continental landmasses terminate in open ocean.
+4. All plates are treated uniformly as continental crust (the oceanic plates distinction has been eliminated so the world forms contiguous land with natural mountain orogeny, rift valleys, and fault scarps rather than sinking into oceanic chasms).
+
+### 1.3 Plate Drift Velocity & Center Bias (`center_bias`)
+
+Each macro plate receives a coherent drift velocity vector $\vec{v}$. The directional distribution can be continuously steered using the `center_bias` parameter ($-1.0 \le b \le +1.0$):
+- **Isotropic Random ($b = 0$)**: Plates drift in uniformly distributed random compass directions.
+- **Inward Convergence ($b > 0$)**: Plates are biased to drift inward toward the world canvas center $(W/2, H/2)$. This forces head-on continental collisions and dramatic orogenic mountain belts near the center of the world, flanked by perimeter rifts.
+- **Outward Divergence ($b < 0$)**: Plates drift outward away from the center. This creates a central rift basin/graben system at the world center and pushes collisional mountain belts toward the perimeter.
+- **Blending Formula**:
+  $$\vec{d}_{\text{bias}} = \begin{cases} \widehat{\vec{r}}_{\text{to\_center}} & \text{if } b \ge 0 \\ -\widehat{\vec{r}}_{\text{to\_center}} & \text{if } b < 0 \end{cases}$$
+  $$\vec{d}_{\text{final}} = \text{normalize}\Big((1 - |b|) \cdot \vec{d}_{\text{rand}} + |b| \cdot \vec{d}_{\text{bias}}\Big)$$
+  $$\vec{v} = \vec{d}_{\text{final}} \cdot \text{speed}$$
 
 ---
 
@@ -107,14 +118,20 @@ When two continental plates collide, folding follows an organic, strike-aligned 
 ### 3.2 Discrete Volcanic Chains in Subduction
 Subduction volcanic cordilleras are modeled as discrete stratovolcano cones spaced along the volcanic front ($\sim 36\text{m}$ spacing), connected by lower volcanic saddles. Offshore, the subducting plate plunges smoothly into an abyssal subduction trench.
 
-### 3.3 Voronoi Triple-Junction Blending & Seamless Littoral Beach
-To completely eliminate Voronoi seam cliffs (e.g. 60m vertical drops where neighbor selection abruptly switches between divergent/convergent plates):
-1. **3-Neighbor Triple-Junction Blending**: `SpatialGrid::query_three_nearest()` identifies the three closest plate centroids ($A, B, C$). When the difference in distance $\delta = d(P, C) - d(P, B)$ is small ($\delta < W_{\text{blend}}$), boundary deformation and baseline elevation are smoothly blended across the medial bisector via quintic smoothing, ensuring $C^1$ continuity and eliminating vertical cliff artifacts without requiring raster blur passes.
-2. **Seamless Coastline Elevation ($d=0$)**:
-   - At the continental-oceanic boundary ($d = 0$), baseline elevation and subduction deformation converge to **exactly $0.0\text{m}$** (sea level) on both sides.
-   - **Land side ($d \ge 0$)**: Climbs gently from $0.0\text{m}$ at the waterline up to $+2.5\text{m}$ (beach crest) across a walkable sandy beach, then smoothly transitions inland into continental lowlands ($+26\text{m}$).
-   - **Oceanic side ($d < 0$)**: Descends from $0.0\text{m}$ to $-2.0\text{m}$ (shallow surf), across the continental shelf ($-8\text{m}$), down the continental slope to deep abyssal plains ($-36\text{m}$).
+### 3.3 Voronoi Triple-Junction Blending & Continuous Continental Boundaries
+To completely eliminate Voronoi seam cliffs (e.g. abrupt vertical steps where neighbor selection switches across plate boundaries):
+1. **3-Neighbor Triple-Junction Blending**: `SpatialGrid::query_three_nearest()` identifies the closest plate centroids ($A, B, C$). When the difference in distance $\delta = d(P, C) - d(P, B)$ is small ($\delta < W_{\text{blend}}$), boundary deformation and baseline elevation are smoothly blended across the medial bisector via quintic smoothing, ensuring $C^1$ continuity and eliminating vertical cliff artifacts without requiring raster blur passes.
+2. **Smooth Baseline Interpolation**:
+   - Across continental plate boundaries, baseline crust elevations smoothly blend towards harmonized vertex target heights using quintic hermite interpolation.
+   - Without oceanic plates, the terrain avoids artificial -36m abyssal drop-offs and retains contiguous playable continental terrain throughout the map.
 3. **Dynamic Littoral Noise Attenuation**: High-amplitude detail noise is smoothly attenuated near the waterline ($|z| < 6\text{m}$), preserving natural micro-relief and gentle sand dunes while preventing steep coastal walls.
+
+### 3.4 Staged Droplet Geomorphic Erosion & Sub-Grid River Extraction ([`dem_erosion.h`](file:///E:/exofarm/exofarm/src/core/dem_erosion.h), [`river_network.h`](file:///E:/exofarm/exofarm/src/core/river_network.h))
+To form genuine dendritic drainage equilibrium suitable for sub-grid continuous spline extraction without artificial Eulerian trench stamping:
+1. **Stage 1 — Network Search** (`35%` droplet budget): Priority-Flood infilling followed by diffuse exploratory droplets (inertia clamped to `[0.05, 0.15]`, `lake_spillway_glide = true`) to link saddles and basins without carving wide inertial channels.
+2. **Stage 2 — Converged Equilibrium** (`45%` droplet budget): Balanced diffuse erosion/deposition droplets (`out_water_sediment`), selective talus scree relaxation ($> 42^\circ$), and wave-cage coastal shoreline shaping (Jeschke 2020) to grade valley slopes naturally.
+3. **Stage 3 — Gentle Pure Deepening** (`20%` droplet budget): Zero-deposition (`deposition_rate = 0`), low-inertia ($\le 0.03$), half-rate (`0.5x`) droplets that hug narrow converged valley thalwegs without widening bends, followed by final Priority-Flood infilling.
+4. **Sub-Grid ($S=4$) MFD Droplet Centerline Extraction & Eulerian Hydraulics**: `extract_from_subgrid_droplets` computes Priority-Flood ramped elevations, MFD ($p=2$) flow headings, and $4\times$ sub-grid droplet occupancy (`occ`, `hx`, `hy`), skeletonizes into directed acyclic `ParameterizedRiverReach` splines with near-perpendicular confluence snapping, and computes monotonic river widths and Eulerian infill/spill water surface levels via `populate_water_fields`.
 
 ---
 

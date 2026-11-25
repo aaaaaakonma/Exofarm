@@ -199,7 +199,7 @@ To verify lockstep synchronisation across networked peers or test runs without t
 
 If two runs produce different 64-bit hashes on the same tick, an out-of-sync divergence has occurred.
 
-### 5.2 Standalone Headless Determinism Test ([`test_determinism.cpp`](file:///E:/exofarm/exofarm/test_determinism.cpp))
+### 5.2 Standalone Headless Determinism Test ([`test_determinism.cpp`](file:///E:/exofarm/exofarm/tests/cpp/test_determinism.cpp))
 The engine includes a standalone validation executable that:
 1. Generates a complex world with 200 enemies, 50 crops, structures, and automated bots.
 2. Captures an initial snapshot.

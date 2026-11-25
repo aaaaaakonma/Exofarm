@@ -21,6 +21,10 @@ extends Node
 @export var smoothing_passes: int = 3
 @export var output_path: String = ""
 
+@export_group("Debug / Iteration Export")
+@export var export_intermediate_iterations: bool = false
+@export var export_directory: String = "res://assets/exports/baked_cages"
+
 @export var bake_cages: bool = false:
 	set(value):
 		if value:
@@ -36,7 +40,9 @@ func _bake() -> ImageTexture:
 	print("WaveCageBaker: Starting GPU bake...")
 	var t0 := Time.get_ticks_msec()
 
-	var rd := RenderingServer.get_rendering_device()
+	var rd := RenderingServer.create_local_rendering_device()
+	if not rd:
+		rd = RenderingServer.get_rendering_device()
 	if not rd:
 		printerr("WaveCageBaker: Compute shaders not supported.")
 		return null
@@ -78,7 +84,7 @@ func _bake() -> ImageTexture:
 	var tex_radii_b: RID = rd.texture_create(io_fmt, RDTextureView.new())
 
 	# Uniform set generator helper
-	var create_set = func(in_t: RID, out_t: RID, orig_t: RID) -> RID:
+	var create_set: Callable = func(in_t: RID, out_t: RID, orig_t: RID) -> RID:
 		var u_hm := RDUniform.new()
 		u_hm.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
 		u_hm.binding = 0
@@ -103,69 +109,156 @@ func _bake() -> ImageTexture:
 		return rd.uniform_set_create([u_hm, u_in, u_out, u_orig], shader, 0)
 
 	# ---- 4. Setup Compute Execution ----
-	var cl := rd.compute_list_begin()
-	rd.compute_list_bind_compute_pipeline(cl, pipeline)
-
 	var groups := int(ceil(float(grid_size) / 16.0))
 	var sea_h := 0.0 # 0.0m sea level
 	var world_dx := physical_size / float(grid_size - 1)
 	var max_steps := int(max_cage_radius / world_dx) + 2
 
-	# Pass 0: Init JFA seeds
-	var set_init: RID = create_set.call(tex_jfa_a, tex_jfa_a, tex_radii_orig)
-	rd.compute_list_bind_uniform_set(cl, set_init, 0)
-	rd.compute_list_set_push_constant(cl, _encode_pc(0, 0, max_steps, grid_size, sea_h, height_scale_factor, physical_size, max_cage_radius, world_dx), 36)
-	rd.compute_list_dispatch(cl, groups, groups, 1)
-	rd.compute_list_add_barrier(cl)
+	var save_step_texture: Callable = func(tex: RID, base_name: String, is_radii: bool) -> void:
+		var b_data := rd.texture_get_data(tex, 0)
+		var img := Image.create_from_data(grid_size, grid_size, false, Image.FORMAT_RGBAF, b_data)
+		var global_dir := ProjectSettings.globalize_path(export_directory)
+		DirAccess.make_dir_recursive_absolute(global_dir)
+		
+		# Save raw 32-bit floating point EXR
+		img.save_exr(global_dir.path_join(base_name + ".exr"))
+		
+		# Save normalized visual PNG for instant viewing
+		var vis := Image.create(grid_size, grid_size, false, Image.FORMAT_RGBA8)
+		for py in range(grid_size):
+			for px in range(grid_size):
+				var p_col := img.get_pixel(px, py)
+				if is_radii:
+					# RGB = (r1, r2, r3) normalized to max_cage_radius
+					var vr1 := clampf(p_col.r / max_cage_radius, 0.0, 1.0)
+					var vr2 := clampf(p_col.g / max_cage_radius, 0.0, 1.0)
+					var vr3 := clampf(p_col.b / max_cage_radius, 0.0, 1.0)
+					vis.set_pixel(px, py, Color(vr1, vr2, vr3, 1.0))
+				else:
+					# JFA seed visualization: Red=seed.x/w, Green=seed.y/h, Blue=dist/max_dist
+					if p_col.r >= 0.0:
+						var sx := p_col.r / float(grid_size)
+						var sy := p_col.g / float(grid_size)
+						var sd := clampf(p_col.b / (float(grid_size) * 0.5), 0.0, 1.0)
+						vis.set_pixel(px, py, Color(sx, sy, sd, 1.0))
+					else:
+						vis.set_pixel(px, py, Color(0.0, 0.0, 0.0, 1.0))
+		vis.save_png(global_dir.path_join(base_name + ".png"))
+		print("  [Exported] %s.png and %s.exr" % [base_name, base_name])
 
-	# Pass 1: Jump Flooding Algorithm (JFA)
-	var cur_jfa: RID = tex_jfa_a
-	var next_jfa: RID = tex_jfa_b
-	var step := int(ceil(float(grid_size) / 2.0))
-	
-	while step >= 1:
-		var set_jfa: RID = create_set.call(cur_jfa, next_jfa, tex_radii_orig)
-		rd.compute_list_bind_uniform_set(cl, set_jfa, 0)
-		rd.compute_list_set_push_constant(cl, _encode_pc(1, step, max_steps, grid_size, sea_h, height_scale_factor, physical_size, max_cage_radius, world_dx), 36)
-		rd.compute_list_dispatch(cl, groups, groups, 1)
-		rd.compute_list_add_barrier(cl)
-
-		var tmp: RID = cur_jfa
-		cur_jfa = next_jfa
-		next_jfa = tmp
-		step /= 2
-
-	# Pass 2: Calculate Initial Radii and Angle
-	var set_radii: RID = create_set.call(cur_jfa, tex_radii_orig, tex_radii_orig)
-	rd.compute_list_bind_uniform_set(cl, set_radii, 0)
-	rd.compute_list_set_push_constant(cl, _encode_pc(2, 0, max_steps, grid_size, sea_h, height_scale_factor, physical_size, max_cage_radius, world_dx), 36)
-	rd.compute_list_dispatch(cl, groups, groups, 1)
-	rd.compute_list_add_barrier(cl)
-
-	# Pass 3: Box Blur (Inequality Constrained)
 	var cur_radii: RID = tex_radii_orig
-	var next_radii: RID = tex_radii_a
-	
-	for i in range(smoothing_passes):
-		var set_blur: RID = create_set.call(cur_radii, next_radii, tex_radii_orig)
-		rd.compute_list_bind_uniform_set(cl, set_blur, 0)
-		rd.compute_list_set_push_constant(cl, _encode_pc(3, 0, max_steps, grid_size, sea_h, height_scale_factor, physical_size, max_cage_radius, world_dx), 36)
+
+	if export_intermediate_iterations:
+		var dispatch_and_sync: Callable = func(in_t: RID, out_t: RID, orig_t: RID, p_idx: int, s_size: int) -> void:
+			var cl_step := rd.compute_list_begin()
+			rd.compute_list_bind_compute_pipeline(cl_step, pipeline)
+			var u_set: RID = create_set.call(in_t, out_t, orig_t)
+			rd.compute_list_bind_uniform_set(cl_step, u_set, 0)
+			rd.compute_list_set_push_constant(cl_step, _encode_pc(p_idx, s_size, max_steps, grid_size, sea_h, height_scale_factor, physical_size, max_cage_radius, world_dx), 36)
+			rd.compute_list_dispatch(cl_step, groups, groups, 1)
+			rd.compute_list_end()
+			rd.submit()
+			rd.sync()
+
+		var global_dir := ProjectSettings.globalize_path(export_directory)
+		DirAccess.make_dir_recursive_absolute(global_dir)
+		hm_img.save_png(global_dir.path_join("00_input_heightmap.png"))
+
+		# Pass 0: Init JFA seeds
+		dispatch_and_sync.call(tex_jfa_a, tex_jfa_a, tex_radii_orig, 0, 0)
+		save_step_texture.call(tex_jfa_a, "01_pass0_init_seeds", false)
+
+		# Pass 1: Jump Flooding Algorithm (JFA)
+		var cur_jfa: RID = tex_jfa_a
+		var next_jfa: RID = tex_jfa_b
+		var step := int(ceil(float(grid_size) / 2.0))
+		var jfa_idx := 0
+		while step >= 1:
+			dispatch_and_sync.call(cur_jfa, next_jfa, tex_radii_orig, 1, step)
+			save_step_texture.call(next_jfa, "02_pass1_jfa_iter%02d_step%03d" % [jfa_idx, step], false)
+			var tmp: RID = cur_jfa
+			cur_jfa = next_jfa
+			next_jfa = tmp
+			step /= 2
+			jfa_idx += 1
+
+		# Pass 2: Calculate Initial Radii and Angle
+		dispatch_and_sync.call(cur_jfa, tex_radii_orig, tex_radii_orig, 2, 0)
+		save_step_texture.call(tex_radii_orig, "03_pass2_initial_radii", true)
+
+		# Pass 3: Box Blur (Inequality Constrained)
+		cur_radii = tex_radii_orig
+		var next_radii: RID = tex_radii_a
+		for i in range(smoothing_passes):
+			dispatch_and_sync.call(cur_radii, next_radii, tex_radii_orig, 3, 0)
+			save_step_texture.call(next_radii, "04_pass3_smoothing_iter%02d" % [i + 1], true)
+			if cur_radii == tex_radii_orig:
+				cur_radii = tex_radii_a
+				next_radii = tex_radii_b
+			else:
+				var tmp: RID = cur_radii
+				cur_radii = next_radii
+				next_radii = tmp
+	else:
+		# Fast path: single compute list submission
+		var cl := rd.compute_list_begin()
+		rd.compute_list_bind_compute_pipeline(cl, pipeline)
+
+		# Pass 0: Init JFA seeds
+		var set_init: RID = create_set.call(tex_jfa_a, tex_jfa_a, tex_radii_orig)
+		rd.compute_list_bind_uniform_set(cl, set_init, 0)
+		rd.compute_list_set_push_constant(cl, _encode_pc(0, 0, max_steps, grid_size, sea_h, height_scale_factor, physical_size, max_cage_radius, world_dx), 36)
 		rd.compute_list_dispatch(cl, groups, groups, 1)
 		rd.compute_list_add_barrier(cl)
 
-		if cur_radii == tex_radii_orig:
-			cur_radii = tex_radii_a
-			next_radii = tex_radii_b
-		else:
-			var tmp: RID = cur_radii
-			cur_radii = next_radii
-			next_radii = tmp
+		# Pass 1: Jump Flooding Algorithm (JFA)
+		var cur_jfa: RID = tex_jfa_a
+		var next_jfa: RID = tex_jfa_b
+		var step := int(ceil(float(grid_size) / 2.0))
+		
+		while step >= 1:
+			var set_jfa: RID = create_set.call(cur_jfa, next_jfa, tex_radii_orig)
+			rd.compute_list_bind_uniform_set(cl, set_jfa, 0)
+			rd.compute_list_set_push_constant(cl, _encode_pc(1, step, max_steps, grid_size, sea_h, height_scale_factor, physical_size, max_cage_radius, world_dx), 36)
+			rd.compute_list_dispatch(cl, groups, groups, 1)
+			rd.compute_list_add_barrier(cl)
 
-	rd.compute_list_end()
-	
-	# Execute and Wait
-	rd.submit()
-	rd.sync()
+			var tmp: RID = cur_jfa
+			cur_jfa = next_jfa
+			next_jfa = tmp
+			step /= 2
+
+		# Pass 2: Calculate Initial Radii and Angle
+		var set_radii: RID = create_set.call(cur_jfa, tex_radii_orig, tex_radii_orig)
+		rd.compute_list_bind_uniform_set(cl, set_radii, 0)
+		rd.compute_list_set_push_constant(cl, _encode_pc(2, 0, max_steps, grid_size, sea_h, height_scale_factor, physical_size, max_cage_radius, world_dx), 36)
+		rd.compute_list_dispatch(cl, groups, groups, 1)
+		rd.compute_list_add_barrier(cl)
+
+		# Pass 3: Box Blur (Inequality Constrained)
+		cur_radii = tex_radii_orig
+		var next_radii: RID = tex_radii_a
+		
+		for i in range(smoothing_passes):
+			var set_blur: RID = create_set.call(cur_radii, next_radii, tex_radii_orig)
+			rd.compute_list_bind_uniform_set(cl, set_blur, 0)
+			rd.compute_list_set_push_constant(cl, _encode_pc(3, 0, max_steps, grid_size, sea_h, height_scale_factor, physical_size, max_cage_radius, world_dx), 36)
+			rd.compute_list_dispatch(cl, groups, groups, 1)
+			rd.compute_list_add_barrier(cl)
+
+			if cur_radii == tex_radii_orig:
+				cur_radii = tex_radii_a
+				next_radii = tex_radii_b
+			else:
+				var tmp: RID = cur_radii
+				cur_radii = next_radii
+				next_radii = tmp
+
+		rd.compute_list_end()
+		
+		# Execute and Wait
+		rd.submit()
+		rd.sync()
 	
 	print("  GPU compute done (%.2fs)" % ((Time.get_ticks_msec() - t0) / 1000.0))
 

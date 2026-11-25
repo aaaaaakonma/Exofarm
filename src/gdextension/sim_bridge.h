@@ -7,8 +7,13 @@
 // sim_core structs → Godot types on the way out.
 
 #include <godot_cpp/classes/node.hpp>
+#include <godot_cpp/classes/image.hpp>
+#include <godot_cpp/classes/image_texture.hpp>
 #include <godot_cpp/variant/typed_array.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
+#include <godot_cpp/variant/vector2.hpp>
+#include <godot_cpp/variant/vector2i.hpp>
+#include <godot_cpp/variant/vector3.hpp>
 #include "world.h"
 
 class SimBridge : public godot::Node {
@@ -42,16 +47,8 @@ public:
     void              equip_item(int64_t entity_id, int64_t slot, int64_t item_id);
     void              unequip_item(int64_t entity_id, int64_t slot);
 
-    // Wall management
-    void              add_wall(int64_t x, int64_t y, int64_t w, int64_t h);
-    void              add_polygon(int64_t x, int64_t y, godot::PackedInt64Array vx, godot::PackedInt64Array vy);
-    void              clear_polygons();
-    godot::TypedArray<godot::Dictionary> get_polygons() const;
-    void              generate_map_cellular_automata(int64_t seed, int64_t width, int64_t height, int64_t cell_size_fixed, int64_t iterations, int64_t fill_prob);
+    // World Map Generation
     void              generate_player_map(int64_t seed, int64_t width, int64_t height, int64_t cell_size_fixed);
-
-    void              clear_walls();
-    godot::TypedArray<godot::Dictionary> get_walls() const;
 
     // Read entity state for renderer — returns [x, y, vel_x, vel_y, health, flags, radius, tags]
     godot::TypedArray<int64_t> get_entity_state(int64_t id) const;
@@ -68,9 +65,6 @@ public:
     godot::Dictionary      generate_item(int64_t id) const;
 
     int64_t                get_state_hash() const;
-
-    godot::Dictionary      get_spatial_info() const;
-    int64_t                get_cell_occupancy(int64_t x, int64_t y) const;
 
     int64_t                get_map_width() const;
     int64_t                get_map_height() const;
@@ -90,10 +84,23 @@ public:
     godot::PackedInt64Array get_soil_sulfur() const;
     godot::PackedInt64Array get_soil_compactness() const;
     
-    void                   plant_crop(int64_t x, int64_t y, int64_t crop_type, int64_t prefix = 0, int64_t suffix = 0, int64_t implicit = 0);
-    void                   harvest_crop(int64_t x, int64_t y);
+    // Farming Pipeline & Soil Actions
+    bool                   till_soil(int64_t x, int64_t y);
+    bool                   water_soil(int64_t x, int64_t y, double amount = 30.0);
+    bool                   plant_crop(int64_t x, int64_t y, int64_t crop_type, int64_t prefix = 0, int64_t suffix = 0, int64_t implicit = 0);
+    bool                   harvest_crop(int64_t x, int64_t y);
+    bool                   is_crop_mature(int64_t x, int64_t y) const;
+    double                 get_soil_moisture(int64_t x, int64_t y) const;
+    int64_t                get_soil_moisture_fixed(int64_t x, int64_t y) const;
+    double                 get_soil_compactness_at(int64_t x, int64_t y) const;
+    int64_t                get_soil_compactness_fixed_at(int64_t x, int64_t y) const;
+    int64_t                get_last_dropped_item() const;
+    godot::Dictionary      get_last_generated_item() const;
+
     void                   place_structure(int64_t x, int64_t y, int64_t structure_type);
     void                   remove_structure(int64_t x, int64_t y);
+    bool                   modify_terrain(int64_t x, int64_t y, int64_t delta_elev);
+    bool                   can_modify_terrain(int64_t x, int64_t y) const;
     void                   apply_fertilizer(int64_t x, int64_t y, int64_t n, int64_t p, int64_t k, int64_t ca, int64_t mg, int64_t s);
     godot::PackedByteArray get_crop_types() const;
     godot::PackedByteArray get_crop_prefixes() const;
@@ -136,6 +143,62 @@ public:
     godot::TypedArray<godot::Dictionary> get_macro_edges() const;
     godot::TypedArray<godot::Dictionary> get_macro_plates() const;
     godot::PackedFloat32Array    get_wave_cage_data(double sea_level = 0.0) const;
+
+    // OpenTopography & Parameterized River APIs
+    void                         set_world_gen_mode(int64_t mode);
+    int64_t                      get_world_gen_mode() const;
+    bool                         load_opentopo_dataset(godot::String path);
+    void                         set_opentopo_sea_level_offset(double offset_meters);
+    double                       get_opentopo_sea_level_offset() const;
+    void                         set_opentopo_sea_buffer_tiles(int64_t tiles);
+    int64_t                      get_opentopo_sea_buffer_tiles() const;
+    void                         set_apply_coastal_erosion(bool enable);
+    bool                         get_apply_coastal_erosion() const;
+    void                         set_coastal_erosion_iterations(int64_t iterations);
+    int64_t                      get_coastal_erosion_iterations() const;
+    void                         set_coastal_erosion_strength(double strength);
+    double                       get_coastal_erosion_strength() const;
+
+    // Droplet Hydraulic Erosion & River Network Parameterization
+    void                         set_apply_droplet_erosion(bool enable);
+    bool                         get_apply_droplet_erosion() const;
+    void                         set_droplet_count(int64_t count);
+    int64_t                      get_droplet_count() const;
+    void                         set_droplet_erosion_rate(double rate);
+    double                       get_droplet_erosion_rate() const;
+    void                         set_droplet_deposition_rate(double rate);
+    double                       get_droplet_deposition_rate() const;
+
+    void                         set_river_min_area(int64_t area);
+    int64_t                      get_river_min_area() const;
+    void                         set_river_width_multiplier(double mult);
+    double                       get_river_width_multiplier() const;
+    void                         set_river_carve_depth(double depth);
+    double                       get_river_carve_depth() const;
+    godot::Dictionary            get_nearest_river_sample(double x, double y) const;
+
+    // Continuous Lagrangian Water Depth & Flux Field (Zero Z-fighting, zero polygon clipping)
+    godot::PackedFloat32Array    get_water_depth() const;
+    godot::PackedFloat32Array    get_water_depth_data() const;
+    godot::Ref<godot::ImageTexture> get_water_depth_texture() const;
+
+    godot::TypedArray<godot::Dictionary> get_parametric_river_reaches() const;
+    godot::TypedArray<godot::Dictionary> get_estuary_mouths() const;
+    godot::Vector2               get_river_flow_vector_at(double x, double y) const;
+
+    // Terrain Tree / Chunked Vegetation APIs
+    bool                         chop_tree(const godot::Vector2 &world_pos, int64_t damage = 25, double max_reach = 0.0);
+    bool                         chop_tree_fixed(int64_t world_x, int64_t world_z, int64_t damage = 25, int64_t max_reach = 0);
+    int64_t                      get_tree_health(int64_t tree_id) const;
+    bool                         is_tree_alive(int64_t tree_id) const;
+    godot::Dictionary            get_nearest_tree(const godot::Vector2 &world_pos, double max_reach = 0.0) const;
+    int64_t                      get_tree_count() const;
+    godot::TypedArray<godot::Dictionary> get_trees_in_chunk(int64_t cx, int64_t cy) const;
+    godot::TypedArray<godot::Dictionary> get_all_trees() const;
+    godot::PackedFloat32Array    get_tree_render_data(int64_t cx = -1, int64_t cy = -1) const;
+    void                         fast_forward_chunk_trees(int64_t cx, int64_t cy, int64_t target_tick);
+    godot::PackedInt32Array      get_chunk_tree_counts() const;
+    godot::Vector2i              get_chunk_grid_size() const;
 
 private:
     static SimBridge *singleton;

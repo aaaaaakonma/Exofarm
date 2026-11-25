@@ -10,6 +10,8 @@
  * Initializes tick counters, ID generators, and pre-allocates memory for core vectors
  * to minimize reallocations during the high-frequency simulation loop.
  */
+const std::vector<uint32_t> SimWorld::_empty_chunk_trees;
+
 SimWorld::SimWorld() : _tick(0), _next_id(1), _rng_shotgun(0), _rng_tornado(0), _rng_crit(0) {
     _hit_pairs.reserve(2048);
     _tick_hit_pairs.reserve(256);
@@ -150,6 +152,8 @@ void SimWorld::tick(const InputFrame &input) {
         _do_place_structure(input.payload.structure.x, input.payload.structure.y, input.payload.structure.structure_type);
     } else if (input.kind == InputFrame::Kind::RemoveStructure) {
         _do_remove_structure(input.payload.structure.x, input.payload.structure.y);
+    } else if (input.kind == InputFrame::Kind::ModifyTerrain) {
+        _do_modify_terrain(input.payload.terrain.x, input.payload.terrain.y, input.payload.terrain.delta_elev);
     } else if (input.kind == InputFrame::Kind::SpawnBot) {
         _do_spawn_bot(input.payload.bot.bot_id, input.payload.bot.bot_type, input.payload.bot.x, input.payload.bot.y);
     } else if (input.kind == InputFrame::Kind::SetBotJob) {
@@ -201,6 +205,7 @@ BisectSnapshot SimWorld::snapshot() const {
     snap.water_table = _water_table;
     snap.aquifers = _aquifers;
     snap.rivers = _rivers;
+    snap.flow_targets = _flow_targets;  // Snapshot fix: was missing
     snap.lakes = _lakes;
     snap.structure_type = _structure_type;
     snap.water_pressure = _water_pressure;
@@ -234,6 +239,13 @@ BisectSnapshot SimWorld::snapshot() const {
     snap.starter_pond_max = _starter_pond_max;
     snap.hydraulic_reservoirs = _hydraulic_graph.get_reservoirs();
     snap.hydraulic_river_belts = _hydraulic_graph.get_river_belts();
+    snap.pump_extractions.clear();
+    for (const auto& kv : _hydraulic_graph.get_pump_extractions()) {
+        snap.pump_extractions.push_back(kv);
+    }
+    std::sort(snap.pump_extractions.begin(), snap.pump_extractions.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    snap.terrain_trees = _terrain_trees;
 
     return snap;
 }
@@ -265,6 +277,7 @@ void SimWorld::restore(const BisectSnapshot &snap) {
     _water_table = snap.water_table;
     _aquifers = snap.aquifers;
     _rivers = snap.rivers;
+    _flow_targets = snap.flow_targets;  // Snapshot fix: was missing
     _lakes = snap.lakes;
     _structure_type = snap.structure_type;
     _water_pressure = snap.water_pressure;
@@ -298,6 +311,34 @@ void SimWorld::restore(const BisectSnapshot &snap) {
     _starter_pond_max = snap.starter_pond_max;
     _hydraulic_graph.set_reservoirs(snap.hydraulic_reservoirs);
     _hydraulic_graph.set_river_belts(snap.hydraulic_river_belts);
+    if (!snap.pump_extractions.empty()) {
+        std::unordered_map<int32_t, int64_t> pe_map;
+        for (const auto& kv : snap.pump_extractions) {
+            pe_map[kv.first] = kv.second;
+        }
+        _hydraulic_graph.set_pump_extractions(pe_map);
+    } else {
+        std::unordered_map<int32_t, int64_t> pe_map;
+        for (size_t i = 0; i < _structure_type.size(); ++i) {
+            if (_structure_type[i] == (uint8_t)StructureType::PUMP) {
+                pe_map[static_cast<int32_t>(i)] = 15LL * ONE / 10;
+            }
+        }
+        _hydraulic_graph.set_pump_extractions(pe_map);
+    }
+
+    _terrain_trees = snap.terrain_trees;
+    int32_t chunk_w = (_map_width + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    int32_t chunk_h = (_map_height + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    _chunk_trees.assign((size_t)chunk_w * chunk_h, {});
+    for (size_t i = 0; i < _terrain_trees.size(); ++i) {
+        const auto& t = _terrain_trees[i];
+        if (t.is_alive()) {
+            if (t.chunk_x >= 0 && t.chunk_x < chunk_w && t.chunk_y >= 0 && t.chunk_y < chunk_h) {
+                _chunk_trees[t.chunk_y * chunk_w + t.chunk_x].push_back(static_cast<uint32_t>(i));
+            }
+        }
+    }
     
     // Geometry Rebuild
     
@@ -375,6 +416,7 @@ uint64_t SimWorld::get_state_hash() const {
     hash_vec(_water_table);
     hash_vec(_aquifers);
     hash_vec(_rivers);
+    hash_vec(_flow_targets);  // Snapshot fix: include in determinism hash
     hash_vec(_lakes);
     hash_vec(_structure_type);
     hash_vec(_water_pressure);
@@ -449,6 +491,22 @@ uint64_t SimWorld::get_state_hash() const {
         hash_combine(&b.water_level, sizeof(b.water_level));
         hash_combine(&b.is_dry, sizeof(b.is_dry));
         hash_vec(b.tile_indices);
+    }
+    
+    for (const auto& t : _terrain_trees) {
+        hash_combine(&t.id, sizeof(t.id));
+        hash_combine(&t.flags, sizeof(t.flags));
+        hash_combine(&t.health, sizeof(t.health));
+    }
+
+    const auto& p_map = _hydraulic_graph.get_pump_extractions();
+    if (!p_map.empty()) {
+        std::vector<std::pair<int32_t, int64_t>> sorted_pumps(p_map.begin(), p_map.end());
+        std::sort(sorted_pumps.begin(), sorted_pumps.end());
+        for (const auto& p : sorted_pumps) {
+            hash_combine(&p.first, sizeof(p.first));
+            hash_combine(&p.second, sizeof(p.second));
+        }
     }
     
     return hash;
@@ -571,19 +629,79 @@ Equipment& SimWorld::get_equipment_mut(EntityID id) {
 void SimWorld::generate_player_map(uint64_t seed, int64_t width, int64_t height, int64_t cell_size_fixed) {
     set_map_dimensions((int32_t)width, (int32_t)height, cell_size_fixed);
 
-    Tectonics::ContinuousTectonicHeightmap::Config cfg = _tectonic_config;
-    cfg.seed = seed;
-    cfg.world_width = width * cell_size_fixed;
-    cfg.world_height = height * cell_size_fixed;
-    if (cfg.num_plates <= 0) cfg.num_plates = 14;
-    _tectonic_heightmap.init(cfg);
-
     int32_t w = static_cast<int32_t>(width);
     int32_t h = static_cast<int32_t>(height);
     size_t total_cells = static_cast<size_t>(w) * h;
 
-    // --- Generate tectonic heightfield ---
-    _tectonic_heightmap.generate_grid(w, h, cell_size_fixed, _elevation);
+    std::vector<Tectonics::TectonicSample> tectonic_samples;
+
+    if (_world_gen_mode == WorldGenMode::SYNTHESIZED_OPENTOPO) {
+        _opentopo_heightmap.generate_grid(
+            w, h, cell_size_fixed, _elevation, seed,
+            _opentopo_sea_level_offset, _opentopo_sea_buffer_tiles,
+            _opentopo_apply_erosion, &_parametric_rivers
+        );
+        _parametric_rivers.burn_to_grid(_rivers, _flow_targets, w, h, cell_size_fixed);
+        _hydraulic_graph.build_from_parametric_network(_parametric_rivers, w, h, cell_size_fixed);
+        if (_opentopo_apply_erosion) {
+            _parametric_rivers.populate_water_fields(
+                _elevation, w, h, cell_size_fixed,
+                _water_depth, _water_flux, _water_flow_x, _water_flow_y
+            );
+        }
+
+        tectonic_samples.resize(total_cells);
+        for (size_t i = 0; i < total_cells; ++i) {
+            tectonic_samples[i].elevation_final = _elevation[i];
+            tectonic_samples[i].primary_type = (_elevation[i] > 0) ? Tectonics::PlateType::CONTINENTAL : Tectonics::PlateType::OCEANIC;
+            tectonic_samples[i].boundary_type = (_elevation[i] > 20 * ONE) ? Tectonics::BoundaryType::CONVERGENT_CONTINENTAL_COLLISION : Tectonics::BoundaryType::PASSIVE_INTERIOR;
+        }
+    } else {
+        Tectonics::ContinuousTectonicHeightmap::Config cfg = _tectonic_config;
+        cfg.seed = seed;
+        cfg.world_width = width * cell_size_fixed;
+        cfg.world_height = height * cell_size_fixed;
+        if (cfg.num_plates <= 0) cfg.num_plates = 14;
+        _tectonic_heightmap.init(cfg);
+        _tectonic_heightmap.generate_grid(w, h, cell_size_fixed, _elevation, nullptr, &tectonic_samples);
+
+        if (_opentopo_apply_erosion) {
+            // Run staged 3-regime genuine droplet erosion: Network Search -> Converged Equilibrium -> Pure Deepening
+            Erosion::StagedErosionConfig staged_cfg;
+            staged_cfg.droplet = _droplet_config;
+            staged_cfg.apply_droplets = _apply_droplet_erosion;
+            staged_cfg.apply_coastal = _apply_coastal_erosion;
+            staged_cfg.coastal_iterations = _coastal_erosion_iterations;
+            staged_cfg.coastal_strength = _coastal_erosion_strength;
+            staged_cfg.talus_threshold = 55705;
+            staged_cfg.talus_iterations = 3;
+            Erosion::apply_staged_geomorphic_erosion(
+                _elevation, w, h, cell_size_fixed, staged_cfg, &_water_sediment
+            );
+
+            // Final Stage: Sub-Grid (S=4) MFD Droplet Centerline Extraction + Eulerian Infill/Spill Hydraulics
+            _parametric_rivers.extract_from_subgrid_droplets(
+                _elevation, w, h, cell_size_fixed,
+                _river_min_area, _river_width_multiplier, seed
+            );
+            _parametric_rivers.burn_to_grid(_rivers, _flow_targets, w, h, cell_size_fixed);
+            _hydraulic_graph.build_from_parametric_network(_parametric_rivers, w, h, cell_size_fixed);
+            _parametric_rivers.populate_water_fields(
+                _elevation, w, h, cell_size_fixed,
+                _water_depth, _water_flux, _water_flow_x, _water_flow_y
+            );
+
+            // Re-sync tectonic samples elevation with carved elevation
+            for (size_t i = 0; i < total_cells; ++i) {
+                tectonic_samples[i].elevation_final = _elevation[i];
+            }
+        } else if (_apply_coastal_erosion && _coastal_erosion_iterations > 0) {
+            Erosion::apply_wave_cage_coastal_erosion(_elevation, w, h, cell_size_fixed, _coastal_erosion_iterations, _coastal_erosion_strength);
+            for (size_t i = 0; i < total_cells; ++i) {
+                tectonic_samples[i].elevation_final = _elevation[i];
+            }
+        }
+    }
 
     int32_t best_spawn_x = w / 2;
     int32_t best_spawn_y = h / 2;
@@ -601,80 +719,48 @@ void SimWorld::generate_player_map(uint64_t seed, int64_t width, int64_t height,
             // --- Read elevation ---
             int64_t el = _elevation[idx];
 
-            // --- Tectonic Sample for structural metadata (boundary type, plate type) ---
-            Tectonics::TectonicSample sample = _tectonic_heightmap.sample(px, py);
+            // --- Tectonic metadata from cached sample (no second sample() call) ---
+            const Tectonics::TectonicSample& sample = tectonic_samples[idx];
 
             // --- Climate Noise ---
-            // Base moisture from FBm (scale independent of elevation)
-            int64_t moisture_base = SimMath::fbm2d(mul_fixed(px, 1200), mul_fixed(py, 1200), seed + 555, 4);
-            // Base temperature: latitude-like gradient + noise
-            int64_t temp = SimMath::fbm2d(mul_fixed(px, 1000), mul_fixed(py, 1000), seed + 777, 3);
+            // Large continental scale (low frequency: ~2.0 periods across map)
+            int64_t moisture_base = SimMath::fbm2d(mul_fixed(px, 160), mul_fixed(py, 160), seed + 555, 3);
+            int64_t temp = SimMath::fbm2d(mul_fixed(px, 140), mul_fixed(py, 140), seed + 777, 3);
 
             // --- Orographic Moisture Effect ---
             // Sample elevation one step in the prevailing wind direction (west→east, i.e. +x)
             // to find local rain-shadow vs. windward slope
             int64_t el_windward = (x > 0) ? _elevation[static_cast<size_t>(y) * w + (x - 1)] : _tectonic_heightmap.sample(px - GRAD_STEP, py).elevation_final;
             int64_t slope_rise = el - el_windward; // positive = ascending slope = windward = more rain
-            // Windward slopes get +moisture, leeward get -moisture
-            int64_t orographic_boost = std::clamp(slope_rise * 3, -18000LL, 18000LL);
+            int64_t orographic_boost = std::clamp(slope_rise * 3, -16000LL, 16000LL);
             int64_t moisture = moisture_base + orographic_boost;
 
-            // --- Biome + Surface Classification ---
-            // Biome codes: 0=OCEAN 1=TUNDRA 2=DESERT 3=GRASSLAND 4=FOREST
-            //              5=TROPICAL_RAINFOREST 6=SWAMP 7=MOUNTAIN 8=BEACH/COAST
+            // --- Simplified Macro Biome Classification ---
+            // 0 = OCEAN (H <= 0)
+            // 3 = GRASSLAND (Temperate open plains, balanced climate)
+            // 4 = FOREST (Humid, woodland & rich loam)
+            // Note: Mountains & coastlines are physical geomorphology, not climate biomes!
             uint8_t b = 0;  // OCEAN default
             uint8_t st = 0; // WATER default
 
-            // Sea level = 0, mountain threshold = 16m (relative to 8m base), beach = 0..3m
             if (el <= 0) {
-                b = 0;   // OCEAN
-                st = 0;  // WATER
-            } else if (el > (16LL * ONE)) {
-                b = 7;   // MOUNTAIN
-                st = 4;  // STONE / ROCK
-            } else if (el < (3LL * ONE)) {
-                // Coastal beach/shoreline zone
-                b = 8;   // BEACH / COAST
-                st = 2;  // SAND
+                b = 0;  // OCEAN
+                st = 0; // WATER
             } else {
-                // Land biome classification: temperature × moisture Whittaker diagram
-                if (temp < -16000) {
-                    // Very cold: tundra regardless of moisture
-                    b = 1;  // TUNDRA / GLACIER
-                    st = 2; // FROZEN DIRT / TUNDRA
-                } else if (moisture < -14000) {
-                    // Very dry
-                    if (temp > 8000) {
-                        b = 2;  // HOT DESERT
-                        st = 2; // SAND
-                    } else {
-                        b = 2;  // COLD DESERT / STEPPE
-                        st = 2; // GRAVEL / DRY SOIL
-                    }
-                } else if (moisture > 24000) {
-                    // Very wet
-                    if (temp > 10000) {
-                        b = 5;  // TROPICAL RAINFOREST
-                        st = 1; // RICH SOIL
-                    } else {
-                        b = 4;  // TEMPERATE RAINFOREST
-                        st = 1; // SOIL
-                    }
-                } else if (moisture > 8000) {
+                if (moisture > 6000) {
+                    // High moisture / windward slopes
                     b = 4;  // FOREST
                     st = 1; // SOIL
-                } else if (el < (8LL * ONE) && moisture > 4000) {
-                    b = 6;  // SWAMP / WETLANDS
-                    st = 1; // MUD / SOIL
                 } else {
+                    // Moderate balanced climate / open plains (grassland)
                     b = 3;  // GRASSLAND / SAVANNA
-                    st = 1; // GRASS / SOIL
+                    st = 1; // GRASS
                 }
 
-                // Spawn scoring: prefer grassland/forest at moderate elevation (~8..25m) near center
+                // Spawn scoring: prefer grassland/forest at moderate elevation (~8..20m) near center
                 if (b == 3 || b == 4) {
                     int64_t dist_to_center = abs_fixed(x - w / 2) + abs_fixed(y - h / 2);
-                    int64_t score = dist_to_center + abs_fixed(el - (18LL * ONE)) / 4;
+                    int64_t score = dist_to_center + abs_fixed(el - (12LL * ONE)) / 4;
                     if (score < min_spawn_dist_to_ideal) {
                         min_spawn_dist_to_ideal = score;
                         best_spawn_x = x;
@@ -820,8 +906,255 @@ void SimWorld::generate_player_map(uint64_t seed, int64_t width, int64_t height,
         }
     }
 
+    if (!_parametric_rivers.reaches.empty()) {
+        // Boost alluvial floodplain soil nutrients along continuous parametric river channels
+        for (const auto& r : _parametric_rivers.reaches) {
+            for (const auto& pt : r.waypoints) {
+                int32_t gx = static_cast<int32_t>(pt.x / cell_size_fixed);
+                int32_t gy = static_cast<int32_t>(pt.y / cell_size_fixed);
+                for (int32_t dy = -2; dy <= 2; ++dy) {
+                    for (int32_t dx = -2; dx <= 2; ++dx) {
+                        int32_t nx = gx + dx;
+                        int32_t ny = gy + dy;
+                        if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+                            size_t idx = static_cast<size_t>(ny) * w + nx;
+                            if (_elevation[idx] > 0 && _elevation[idx] <= 16 * ONE) {
+                                _soil_nitrogen[idx] = static_cast<int32_t>(std::clamp(static_cast<int64_t>(_soil_nitrogen[idx]) + 40LL * ONE, 60LL * ONE, 240LL * ONE));
+                                _soil_phosphorus[idx] = static_cast<int32_t>(std::clamp(static_cast<int64_t>(_soil_phosphorus[idx]) + 30LL * ONE, 40LL * ONE, 180LL * ONE));
+                                _soil_compactness[idx] = static_cast<int32_t>(std::clamp(static_cast<int64_t>(_soil_compactness[idx]) - 15LL * ONE, 15LL * ONE, 45LL * ONE));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     _starter_spawn_x = best_spawn_x;
     _starter_spawn_y = best_spawn_y;
+
+    // Generate chunked procedural vegetation & trees across the world
+    generate_vegetation(seed, w, h, cell_size_fixed);
+}
+
+void SimWorld::generate_vegetation(uint64_t seed, int32_t w, int32_t h, int64_t cell_size_fixed) {
+    if (w <= 0 || h <= 0) return;
+
+    int32_t chunk_w = (w + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    int32_t chunk_h = (h + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    size_t total_chunks = static_cast<size_t>(chunk_w) * chunk_h;
+    _chunk_trees.assign(total_chunks, {});
+    _terrain_trees.clear();
+    _terrain_trees.reserve(4096);
+
+    for (int32_t cy = 0; cy < chunk_h; ++cy) {
+        for (int32_t cx = 0; cx < chunk_w; ++cx) {
+            uint64_t chunk_seed = seed ^ (static_cast<uint64_t>(cx) * 73856093ULL)
+                                       ^ (static_cast<uint64_t>(cy) * 19349663ULL);
+            SplitMix64 rng(chunk_seed);
+
+            // Jittered 4x4 candidate slots within each 16x16 tile chunk
+            for (int32_t sy = 0; sy < 4; ++sy) {
+                for (int32_t sx = 0; sx < 4; ++sx) {
+                    int32_t jx = static_cast<int32_t>(rng.next() % 4);
+                    int32_t jy = static_cast<int32_t>(rng.next() % 4);
+                    int32_t tx = cx * CHUNK_SIZE + sx * 4 + jx;
+                    int32_t ty = cy * CHUNK_SIZE + sy * 4 + jy;
+
+                    if (tx >= w || ty >= h) continue;
+                    size_t idx = static_cast<size_t>(ty) * w + tx;
+
+                    int64_t el = _elevation[idx];
+                    if (el <= 0) continue; // Underwater / ocean
+
+                    // Avoid water bodies, active river channels, and lakes
+                    if (!_rivers.empty() && _rivers[idx] != 0) continue;
+                    if (!_lakes.empty() && _lakes[idx] != 0) continue;
+
+                    // Compute terrain normal & slope
+                    int64_t el_e = (tx + 1 < w) ? _elevation[idx + 1] : el;
+                    int64_t el_w = (tx > 0) ? _elevation[idx - 1] : el;
+                    int64_t el_s = (ty + 1 < h) ? _elevation[idx + w] : el;
+                    int64_t el_n = (ty > 0) ? _elevation[idx - w] : el;
+                    int64_t slope_x = (el_e - el_w) / 2;
+                    int64_t slope_z = (el_s - el_n) / 2;
+                    int64_t slope_sq = mul_fixed(slope_x, slope_x) + mul_fixed(slope_z, slope_z);
+                    if (slope_sq > (3LL * ONE * ONE)) continue; // Sheer cliff wall
+
+                    // Clearance radius around starter spawn point
+                    int32_t s_dx = tx - _starter_spawn_x;
+                    int32_t s_dy = ty - _starter_spawn_y;
+                    if (s_dx * s_dx + s_dy * s_dy < 64) continue; // ~16m clearing
+
+                    uint8_t b = (!_biome.empty()) ? _biome[idx] : 0;
+                    int chance_pct = 0;
+                    uint8_t species = 0; // 0: Conifer, 1: Oak, 2: Birch, 3: Dead Snag
+
+                    switch (b) {
+                        case 1: { // Tundra
+                            chance_pct = 35;
+                            uint64_t r = rng.next() % 100;
+                            species = (r < 85) ? 0 : 3; // 85% Conifer, 15% Dead Snag
+                            break;
+                        }
+                        case 2: // Desert
+                            chance_pct = 0;
+                            break;
+                        case 3: { // Grassland / Savanna
+                            chance_pct = 18;
+                            uint64_t r = rng.next() % 100;
+                            species = (r < 50) ? 1 : 2; // 50% Oak, 50% Birch
+                            break;
+                        }
+                        case 4: { // Continental Forest
+                            chance_pct = 80;
+                            uint64_t r = rng.next() % 100;
+                            if (r < 45) species = 1;      // 45% Broadleaf Oak
+                            else if (r < 85) species = 2; // 40% Slender Birch
+                            else species = 0;            // 15% Conifer
+                            break;
+                        }
+                        case 5: { // Tropical Rainforest
+                            chance_pct = 85;
+                            uint64_t r = rng.next() % 100;
+                            species = (r < 60) ? 1 : 2; // 60% Oak, 40% Birch
+                            break;
+                        }
+                        case 6: { // Swamp & Wetland
+                            chance_pct = 45;
+                            uint64_t r = rng.next() % 100;
+                            if (r < 45) species = 3;      // 45% Dead Snag
+                            else if (r < 80) species = 2; // 35% Slender Birch
+                            else species = 1;            // 20% Oak
+                            break;
+                        }
+                        case 7: { // High Mountain
+                            if (el > (38LL * ONE)) {
+                                chance_pct = 0; // Above alpine treeline
+                            } else {
+                                chance_pct = 15;
+                                uint64_t r = rng.next() % 100;
+                                species = (r < 70) ? 0 : 3; // 70% Conifer, 30% Dead Snag
+                            }
+                            break;
+                        }
+                        default:
+                            chance_pct = 0;
+                            break;
+                    }
+
+                    if (chance_pct <= 0 || (rng.next() % 100) >= static_cast<uint64_t>(chance_pct)) {
+                        continue;
+                    }
+
+                    // Precise world position within the cell
+                    int64_t j_off_x = (static_cast<int64_t>(rng.next() % 32768) - 16384) * (cell_size_fixed / ONE);
+                    int64_t j_off_z = (static_cast<int64_t>(rng.next() % 32768) - 16384) * (cell_size_fixed / ONE);
+                    int64_t wx = static_cast<int64_t>(tx) * cell_size_fixed + (cell_size_fixed / 2) + (j_off_x / 65536);
+                    int64_t wz = static_cast<int64_t>(ty) * cell_size_fixed + (cell_size_fixed / 2) + (j_off_z / 65536);
+                    int64_t wy = el;
+
+                    Vec3Fixed norm(-slope_x, ONE, -slope_z);
+                    norm = norm.normalized();
+
+                    // Randomized Initial Age & Scale
+                    int64_t init_age;
+                    if (species == 3) {
+                        init_age = (85LL * ONE) / 100 + ((rng.next() % 15) * ONE) / 100; // Snags are old
+                    } else {
+                        init_age = (25LL * ONE) / 100 + ((rng.next() % 75) * ONE) / 100; // Sapling to mature
+                    }
+                    int64_t max_scale = (80LL * ONE) / 100 + ((rng.next() % 40) * ONE) / 100; // [0.80..1.20]
+
+                    TerrainTree tree;
+                    tree.id = static_cast<uint32_t>(_terrain_trees.size() + 1);
+                    tree.chunk_x = cx;
+                    tree.chunk_y = cy;
+                    tree.x = wx;
+                    tree.z = wz;
+                    tree.elevation = wy;
+                    tree.normal_x = norm.x;
+                    tree.normal_y = norm.y;
+                    tree.normal_z = norm.z;
+                    tree.species = species;
+                    tree.age_growth = init_age;
+                    tree.max_scale = max_scale;
+                    tree.seed = rng.next();
+                    tree.last_sim_tick = 0;
+                    tree.flags = 1; // Alive
+                    tree.health = 100;
+                    tree.max_health = 100;
+
+                    uint32_t tree_idx = static_cast<uint32_t>(_terrain_trees.size());
+                    _terrain_trees.push_back(tree);
+                    _chunk_trees[static_cast<size_t>(cy) * chunk_w + cx].push_back(tree_idx);
+                }
+            }
+        }
+    }
+
+    // --- Offline Simulation / Warm-Up Pass ---
+    // Let the generator run offline to establish initial stand competition and aged equilibrium
+    for (size_t c_idx = 0; c_idx < total_chunks; ++c_idx) {
+        auto& c_trees = _chunk_trees[c_idx];
+        if (c_trees.size() <= 1) continue;
+
+        // Mutual crown spacing and competition check
+        for (size_t i = 0; i < c_trees.size(); ++i) {
+            TerrainTree& t1 = _terrain_trees[c_trees[i]];
+            for (size_t j = i + 1; j < c_trees.size(); ++j) {
+                TerrainTree& t2 = _terrain_trees[c_trees[j]];
+                int64_t dx = t1.x - t2.x;
+                int64_t dz = t1.z - t2.z;
+                int64_t dist_sq = mul_fixed(dx, dx) + mul_fixed(dz, dz);
+
+                // If trees are within 3.5m spacing (3.5 * ONE)^2 = ~12.25 * ONE
+                if (dist_sq < (12LL * ONE)) {
+                    // Larger tree suppresses smaller tree
+                    if (t1.age_growth >= t2.age_growth) {
+                        t2.age_growth = std::max((20LL * ONE) / 100, t2.age_growth - (10LL * ONE) / 100);
+                        if (dist_sq < (4LL * ONE)) t2.species = 3; // Extreme shade turns into dead snag
+                    } else {
+                        t1.age_growth = std::max((20LL * ONE) / 100, t1.age_growth - (10LL * ONE) / 100);
+                        if (dist_sq < (4LL * ONE)) t1.species = 3;
+                    }
+                }
+            }
+        }
+    }
+}
+
+const std::vector<uint32_t>& SimWorld::get_trees_in_chunk(int32_t cx, int32_t cy) const {
+    int32_t chunk_w = (_map_width + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    int32_t chunk_h = (_map_height + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    if (cx < 0 || cx >= chunk_w || cy < 0 || cy >= chunk_h || _chunk_trees.empty()) {
+        return _empty_chunk_trees;
+    }
+    size_t idx = static_cast<size_t>(cy) * chunk_w + cx;
+    if (idx >= _chunk_trees.size()) return _empty_chunk_trees;
+    return _chunk_trees[idx];
+}
+
+void SimWorld::fast_forward_chunk_trees(int32_t cx, int32_t cy, uint32_t target_tick) {
+    int32_t chunk_w = (_map_width + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    int32_t chunk_h = (_map_height + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    if (cx < 0 || cx >= chunk_w || cy < 0 || cy >= chunk_h || _chunk_trees.empty()) {
+        return;
+    }
+    size_t c_idx = static_cast<size_t>(cy) * chunk_w + cx;
+    if (c_idx >= _chunk_trees.size()) return;
+
+    for (uint32_t tid : _chunk_trees[c_idx]) {
+        if (tid >= _terrain_trees.size()) continue;
+        TerrainTree& tree = _terrain_trees[tid];
+        if (target_tick > tree.last_sim_tick) {
+            uint32_t dt = target_tick - tree.last_sim_tick;
+            // Tree grows gradually with simulation time (e.g. 1.0 growth over ~6000 ticks)
+            int64_t growth_inc = (static_cast<int64_t>(dt) * ONE) / 6000;
+            tree.age_growth = std::min(ONE, tree.age_growth + growth_inc);
+            tree.last_sim_tick = target_tick;
+        }
+    }
 }
 
 
@@ -980,6 +1313,7 @@ std::vector<uint8_t> SimWorld::serialize_snapshot(const BisectSnapshot &snap) {
     write_vec(snap.water_table);
     write_vec(snap.aquifers);
     write_vec(snap.rivers);
+    write_vec(snap.flow_targets);  // Snapshot fix: was missing
     write_vec(snap.lakes);
     write_vec(snap.structure_type);
     write_vec(snap.water_pressure);
@@ -1049,135 +1383,169 @@ std::vector<uint8_t> SimWorld::serialize_snapshot(const BisectSnapshot &snap) {
         write_vec(b.tile_indices);
     }
 
+    write_vec(snap.terrain_trees);
+
+    uint32_t num_pumps = (uint32_t)snap.pump_extractions.size();
+    buffer.insert(buffer.end(), reinterpret_cast<const uint8_t*>(&num_pumps), reinterpret_cast<const uint8_t*>(&num_pumps) + sizeof(uint32_t));
+    for (const auto& pe : snap.pump_extractions) {
+        buffer.insert(buffer.end(), reinterpret_cast<const uint8_t*>(&pe.first), reinterpret_cast<const uint8_t*>(&pe.first) + sizeof(int32_t));
+        buffer.insert(buffer.end(), reinterpret_cast<const uint8_t*>(&pe.second), reinterpret_cast<const uint8_t*>(&pe.second) + sizeof(int64_t));
+    }
+
     return buffer;
 }
 
 /**
  * Reconstructs a BisectSnapshot from a binary buffer.
  */
-const uint8_t* SimWorld::deserialize_snapshot(BisectSnapshot &snap, const uint8_t *ptr) {
-    auto read_pod = [&](auto& val) {
+const uint8_t* SimWorld::deserialize_snapshot(BisectSnapshot &snap, const uint8_t *ptr, size_t total_size) {
+    const uint8_t* end_ptr = total_size > 0 ? (ptr + total_size) : reinterpret_cast<const uint8_t*>(UINTPTR_MAX);
+    auto read_pod = [&](auto& val) -> bool {
+        if (ptr + sizeof(val) > end_ptr) return false;
         memcpy(&val, ptr, sizeof(val));
         ptr += sizeof(val);
+        return true;
     };
-    auto read_vec = [&](auto& vec) {
+    auto read_vec = [&](auto& vec) -> bool {
+        if (ptr + sizeof(uint32_t) > end_ptr) return false;
         uint32_t size;
         memcpy(&size, ptr, sizeof(uint32_t));
         ptr += sizeof(uint32_t);
-        vec.resize(size);
         if (size > 0) {
-            memcpy(vec.data(), ptr, size * sizeof(vec[0]));
-            ptr += size * sizeof(vec[0]);
+            size_t bytes = static_cast<size_t>(size) * sizeof(vec[0]);
+            if (ptr + bytes > end_ptr) return false;
+            vec.resize(size);
+            memcpy(vec.data(), ptr, bytes);
+            ptr += bytes;
+        } else {
+            vec.clear();
         }
+        return true;
     };
 
-    read_pod(snap.tick);
-    read_pod(snap.next_id);
-    read_pod(snap.shotgun_seed);
-    read_pod(snap.tornado_seed);
-    read_pod(snap.crit_seed);
+    if (!read_pod(snap.tick)) return nullptr;
+    if (!read_pod(snap.next_id)) return nullptr;
+    if (!read_pod(snap.shotgun_seed)) return nullptr;
+    if (!read_pod(snap.tornado_seed)) return nullptr;
+    if (!read_pod(snap.crit_seed)) return nullptr;
 
-    read_vec(snap.chaos.dense_ids);
-    read_vec(snap.chaos.node_ids);
-    read_vec(snap.chaos.tree_min_x);
-    read_vec(snap.chaos.tree_min_y);
-    read_vec(snap.chaos.tree_max_x);
-    read_vec(snap.chaos.tree_max_y);
-    read_vec(snap.chaos.positions_x);
-    read_vec(snap.chaos.positions_y);
-    read_vec(snap.chaos.velocities_x);
-    read_vec(snap.chaos.velocities_y);
-    read_vec(snap.chaos.radii);
-    read_vec(snap.chaos.frictions);
-    read_vec(snap.chaos.healths);
-    read_vec(snap.chaos.pierces);
-    read_vec(snap.chaos.types);
-    read_vec(snap.chaos.tags);
-    read_vec(snap.chaos.flags);
-    read_vec(snap.heavy_stats);
-    read_vec(snap.heavy_equip);
-    read_vec(snap.entity_recycle_bin);
-    read_vec(snap.attack_recycle_bin);
-    read_vec(snap.hit_pairs);
+    if (!read_vec(snap.chaos.dense_ids)) return nullptr;
+    if (!read_vec(snap.chaos.node_ids)) return nullptr;
+    if (!read_vec(snap.chaos.tree_min_x)) return nullptr;
+    if (!read_vec(snap.chaos.tree_min_y)) return nullptr;
+    if (!read_vec(snap.chaos.tree_max_x)) return nullptr;
+    if (!read_vec(snap.chaos.tree_max_y)) return nullptr;
+    if (!read_vec(snap.chaos.positions_x)) return nullptr;
+    if (!read_vec(snap.chaos.positions_y)) return nullptr;
+    if (!read_vec(snap.chaos.velocities_x)) return nullptr;
+    if (!read_vec(snap.chaos.velocities_y)) return nullptr;
+    if (!read_vec(snap.chaos.radii)) return nullptr;
+    if (!read_vec(snap.chaos.frictions)) return nullptr;
+    if (!read_vec(snap.chaos.healths)) return nullptr;
+    if (!read_vec(snap.chaos.pierces)) return nullptr;
+    if (!read_vec(snap.chaos.types)) return nullptr;
+    if (!read_vec(snap.chaos.tags)) return nullptr;
+    if (!read_vec(snap.chaos.flags)) return nullptr;
+    if (!read_vec(snap.heavy_stats)) return nullptr;
+    if (!read_vec(snap.heavy_equip)) return nullptr;
+    if (!read_vec(snap.entity_recycle_bin)) return nullptr;
+    if (!read_vec(snap.attack_recycle_bin)) return nullptr;
+    if (!read_vec(snap.hit_pairs)) return nullptr;
 
     // Map properties for farming game
-    read_pod(snap.map_width);
-    read_pod(snap.map_height);
-    read_pod(snap.cell_size_fixed);
-    read_vec(snap.water_table);
-    read_vec(snap.aquifers);
-    read_vec(snap.rivers);
-    read_vec(snap.lakes);
-    read_vec(snap.structure_type);
-    read_vec(snap.water_pressure);
-    read_vec(snap.actuator_activated);
-    read_vec(snap.bot_states);
-    read_vec(snap.chunk_tiers);
-    read_vec(snap.soil_nitrogen);
-    read_vec(snap.soil_phosphorus);
-    read_vec(snap.soil_potassium);
-    read_vec(snap.soil_calcium);
-    read_vec(snap.soil_magnesium);
-    read_vec(snap.soil_sulfur);
-    read_vec(snap.soil_compactness);
-    read_vec(snap.crop_type);
-    read_vec(snap.crop_growth);
-    read_vec(snap.crop_health);
-    read_vec(snap.crop_prefix);
-    read_vec(snap.crop_suffix);
-    read_vec(snap.crop_implicit);
-    read_vec(snap.planted_tile_indices);
-    read_pod(snap.weather_state);
-    read_pod(snap.weather_timer);
-    read_pod(snap.co2_level);
-    read_vec(snap.elevation);
-    read_vec(snap.biome);
-    read_vec(snap.surface_type);
-    read_vec(snap.mineral_type);
-    read_pod(snap.starter_spawn_x);
-    read_pod(snap.starter_spawn_y);
-    read_pod(snap.starter_pond_volume);
-    read_pod(snap.starter_pond_max);
+    if (!read_pod(snap.map_width)) return nullptr;
+    if (!read_pod(snap.map_height)) return nullptr;
+    if (!read_pod(snap.cell_size_fixed)) return nullptr;
+    if (!read_vec(snap.water_table)) return nullptr;
+    if (!read_vec(snap.aquifers)) return nullptr;
+    if (!read_vec(snap.rivers)) return nullptr;
+    if (!read_vec(snap.flow_targets)) return nullptr;
+    if (!read_vec(snap.lakes)) return nullptr;
+    if (!read_vec(snap.structure_type)) return nullptr;
+    if (!read_vec(snap.water_pressure)) return nullptr;
+    if (!read_vec(snap.actuator_activated)) return nullptr;
+    if (!read_vec(snap.bot_states)) return nullptr;
+    if (!read_vec(snap.chunk_tiers)) return nullptr;
+    if (!read_vec(snap.soil_nitrogen)) return nullptr;
+    if (!read_vec(snap.soil_phosphorus)) return nullptr;
+    if (!read_vec(snap.soil_potassium)) return nullptr;
+    if (!read_vec(snap.soil_calcium)) return nullptr;
+    if (!read_vec(snap.soil_magnesium)) return nullptr;
+    if (!read_vec(snap.soil_sulfur)) return nullptr;
+    if (!read_vec(snap.soil_compactness)) return nullptr;
+    if (!read_vec(snap.crop_type)) return nullptr;
+    if (!read_vec(snap.crop_growth)) return nullptr;
+    if (!read_vec(snap.crop_health)) return nullptr;
+    if (!read_vec(snap.crop_prefix)) return nullptr;
+    if (!read_vec(snap.crop_suffix)) return nullptr;
+    if (!read_vec(snap.crop_implicit)) return nullptr;
+    if (!read_vec(snap.planted_tile_indices)) return nullptr;
+    if (!read_pod(snap.weather_state)) return nullptr;
+    if (!read_pod(snap.weather_timer)) return nullptr;
+    if (!read_pod(snap.co2_level)) return nullptr;
+    if (!read_vec(snap.elevation)) return nullptr;
+    if (!read_vec(snap.biome)) return nullptr;
+    if (!read_vec(snap.surface_type)) return nullptr;
+    if (!read_vec(snap.mineral_type)) return nullptr;
+    if (!read_pod(snap.starter_spawn_x)) return nullptr;
+    if (!read_pod(snap.starter_spawn_y)) return nullptr;
+    if (!read_pod(snap.starter_pond_volume)) return nullptr;
+    if (!read_pod(snap.starter_pond_max)) return nullptr;
 
     // Hydraulic Reservoirs
     uint32_t num_res = 0;
-    read_pod(num_res);
+    if (!read_pod(num_res)) return nullptr;
     snap.hydraulic_reservoirs.resize(num_res);
     for (uint32_t i = 0; i < num_res; ++i) {
         auto& r = snap.hydraulic_reservoirs[i];
-        read_pod(r.id);
-        read_pod(r.current_volume);
-        read_pod(r.max_capacity);
-        read_pod(r.water_level);
-        read_pod(r.tile_count);
-        read_pod(r.inflow_rate);
-        read_pod(r.outflow_rate);
-        read_pod(r.extraction_rate);
-        read_pod(r.seepage_rate);
-        read_pod(r.is_infinite);
-        read_pod(r.is_dry);
-        read_vec(r.tile_indices);
+        if (!read_pod(r.id)) return nullptr;
+        if (!read_pod(r.current_volume)) return nullptr;
+        if (!read_pod(r.max_capacity)) return nullptr;
+        if (!read_pod(r.water_level)) return nullptr;
+        if (!read_pod(r.tile_count)) return nullptr;
+        if (!read_pod(r.inflow_rate)) return nullptr;
+        if (!read_pod(r.outflow_rate)) return nullptr;
+        if (!read_pod(r.extraction_rate)) return nullptr;
+        if (!read_pod(r.seepage_rate)) return nullptr;
+        if (!read_pod(r.is_infinite)) return nullptr;
+        if (!read_pod(r.is_dry)) return nullptr;
+        if (!read_vec(r.tile_indices)) return nullptr;
     }
 
     // Hydraulic River Belts
     uint32_t num_belts = 0;
-    read_pod(num_belts);
+    if (!read_pod(num_belts)) return nullptr;
     snap.hydraulic_river_belts.resize(num_belts);
     for (uint32_t i = 0; i < num_belts; ++i) {
         auto& b = snap.hydraulic_river_belts[i];
-        read_pod(b.id);
-        read_pod(b.from_node);
-        read_pod(b.to_node);
-        read_pod(b.upstream_belt_id);
-        read_pod(b.downstream_belt_id);
-        read_pod(b.tile_count);
-        read_pod(b.max_rate);
-        read_pod(b.pump_rate);
-        read_pod(b.flow_rate);
-        read_pod(b.water_level);
-        read_pod(b.is_dry);
-        read_vec(b.tile_indices);
+        if (!read_pod(b.id)) return nullptr;
+        if (!read_pod(b.from_node)) return nullptr;
+        if (!read_pod(b.to_node)) return nullptr;
+        if (!read_pod(b.upstream_belt_id)) return nullptr;
+        if (!read_pod(b.downstream_belt_id)) return nullptr;
+        if (!read_pod(b.tile_count)) return nullptr;
+        if (!read_pod(b.max_rate)) return nullptr;
+        if (!read_pod(b.pump_rate)) return nullptr;
+        if (!read_pod(b.flow_rate)) return nullptr;
+        if (!read_pod(b.water_level)) return nullptr;
+        if (!read_pod(b.is_dry)) return nullptr;
+        if (!read_vec(b.tile_indices)) return nullptr;
     }
+
+    if (!read_vec(snap.terrain_trees)) return nullptr;
+
+    uint32_t num_pumps = 0;
+    if (ptr < end_ptr && read_pod(num_pumps)) {
+        snap.pump_extractions.resize(num_pumps);
+        for (uint32_t i = 0; i < num_pumps; ++i) {
+            if (!read_pod(snap.pump_extractions[i].first)) return nullptr;
+            if (!read_pod(snap.pump_extractions[i].second)) return nullptr;
+        }
+    } else {
+        snap.pump_extractions.clear();
+    }
+
+    return ptr;
 
     return ptr;
 }
@@ -1333,8 +1701,7 @@ void SimWorld::tick_environment() {
                 damage_crop(r_idx, 9999 * ONE);
             }
             if (_structure_type[r_idx] != 0) {
-                _structure_type[r_idx] = 0;
-                _water_pressure[r_idx] = 0;
+                _do_remove_structure(rx, ry);
             }
         }
     }
@@ -1418,6 +1785,7 @@ void SimWorld::tick_environment() {
 
     int32_t chunk_w = (_map_width + CHUNK_SIZE - 1) / CHUNK_SIZE;
     int32_t chunk_h = (_map_height + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    if (chunk_w <= 0 || chunk_h <= 0 || _chunk_tiers.size() < (size_t)chunk_w * chunk_h) return;
 
     std::vector<int32_t> next_wt = _water_table;
     bool any_updated = false;
@@ -1693,11 +2061,157 @@ void SimWorld::tick_environment() {
     }
 }
 
-void SimWorld::plant_crop(int32_t x, int32_t y, uint8_t crop_type, uint8_t prefix, uint8_t suffix, uint8_t implicit) {
-    if (x < 0 || x >= _map_width || y < 0 || y >= _map_height) return;
+// --- Wood Chopping & Tree Interactions ---
+bool SimWorld::chop_tree(int64_t world_x, int64_t world_z, int32_t damage, int64_t max_reach) {
+    int32_t dmg = (damage >= 65536) ? (damage / 65536) : damage;
+    if (dmg <= 0) dmg = 25;
+
+    int64_t reach = (max_reach > 0) ? max_reach : ((_cell_size_fixed > 0) ? _cell_size_fixed * 2 : 128LL * ONE);
+    int64_t reach_sq = mul_fixed(reach, reach);
+
+    int64_t min_dist_sq = INT64_MAX;
+    int32_t best_idx = -1;
+
+    for (size_t i = 0; i < _terrain_trees.size(); ++i) {
+        const auto& t = _terrain_trees[i];
+        if (!t.is_alive()) continue;
+        int64_t dx = t.x - world_x;
+        int64_t dz = t.z - world_z;
+        if (std::abs(dx) > reach || std::abs(dz) > reach) continue;
+        int64_t dist_sq = mul_fixed(dx, dx) + mul_fixed(dz, dz);
+        if (dist_sq <= reach_sq && dist_sq < min_dist_sq) {
+            min_dist_sq = dist_sq;
+            best_idx = static_cast<int32_t>(i);
+        }
+    }
+
+    if (best_idx < 0) return false;
+
+    TerrainTree& tree = _terrain_trees[best_idx];
+    tree.health -= dmg;
+
+    if (tree.health <= 0) {
+        tree.health = 0;
+        tree.flags &= ~static_cast<uint8_t>(TerrainTreeFlags::TREE_ALIVE);
+        tree.flags |= static_cast<uint8_t>(TerrainTreeFlags::TREE_FELLED);
+
+        // Remove from chunk tree spatial lookup
+        int32_t chunk_w = get_chunk_grid_w();
+        int32_t chunk_h = get_chunk_grid_h();
+        if (tree.chunk_x >= 0 && tree.chunk_x < chunk_w && tree.chunk_y >= 0 && tree.chunk_y < chunk_h) {
+            size_t c_idx = static_cast<size_t>(tree.chunk_y) * chunk_w + tree.chunk_x;
+            if (c_idx < _chunk_trees.size()) {
+                auto& ctrees = _chunk_trees[c_idx];
+                auto it = std::find(ctrees.begin(), ctrees.end(), static_cast<uint32_t>(best_idx));
+                if (it != ctrees.end()) {
+                    ctrees.erase(it);
+                }
+            }
+        }
+
+        // Deterministic wood drop using ItemData
+        uint64_t wood_seed = tree.seed ^ 0x574F4F44ULL ^ (static_cast<uint64_t>(_tick) * 2654435761ULL);
+        if (wood_seed == 0) wood_seed = 1;
+        ItemData wood_item = ItemData::generate(wood_seed);
+
+        EntityID drop_id = spawn_entity(EntityType::ITEM, tree.x, tree.z, 16 * ONE, 1, 0);
+        equip_item(drop_id, 0, wood_seed);
+        _last_dropped_item = drop_id;
+        _last_generated_item = wood_item;
+    }
+
+    return true;
+}
+
+int32_t SimWorld::get_tree_health(uint32_t tree_id) const {
+    for (const auto& t : _terrain_trees) {
+        if (t.id == tree_id) return t.health;
+    }
+    return 0;
+}
+
+bool SimWorld::is_tree_alive(uint32_t tree_id) const {
+    for (const auto& t : _terrain_trees) {
+        if (t.id == tree_id) return t.is_alive();
+    }
+    return false;
+}
+
+const TerrainTree* SimWorld::get_tree_by_id(uint32_t tree_id) const {
+    for (const auto& t : _terrain_trees) {
+        if (t.id == tree_id) return &t;
+    }
+    return nullptr;
+}
+
+const TerrainTree* SimWorld::get_nearest_tree(int64_t world_x, int64_t world_z, int64_t max_reach) const {
+    int64_t reach = (max_reach > 0) ? max_reach : ((_cell_size_fixed > 0) ? _cell_size_fixed * 2 : 128LL * ONE);
+    int64_t reach_sq = mul_fixed(reach, reach);
+
+    int64_t min_dist_sq = INT64_MAX;
+    const TerrainTree* best_tree = nullptr;
+
+    for (const auto& t : _terrain_trees) {
+        if (!t.is_alive()) continue;
+        int64_t dx = t.x - world_x;
+        int64_t dz = t.z - world_z;
+        if (std::abs(dx) > reach || std::abs(dz) > reach) continue;
+        int64_t dist_sq = mul_fixed(dx, dx) + mul_fixed(dz, dz);
+        if (dist_sq <= reach_sq && dist_sq < min_dist_sq) {
+            min_dist_sq = dist_sq;
+            best_tree = &t;
+        }
+    }
+    return best_tree;
+}
+
+// --- Farming Pipeline ---
+bool SimWorld::till_soil(int32_t x, int32_t y) {
+    if (x < 0 || x >= _map_width || y < 0 || y >= _map_height) return false;
     int32_t idx = y * _map_width + x;
+
+    uint8_t st = _surface_type[idx];
+    if (st == static_cast<uint8_t>(Generation::SurfaceType::WATER_DEEP) ||
+        st == static_cast<uint8_t>(Generation::SurfaceType::ROCK_CLIFF)) {
+        return false;
+    }
+
+    _surface_type[idx] = static_cast<uint8_t>(Generation::SurfaceType::TILLED_SOIL);
+
+    int64_t new_comp = static_cast<int64_t>(_soil_compactness[idx]) - 30LL * ONE;
+    if (new_comp < 10LL * ONE) new_comp = 10LL * ONE;
+    _soil_compactness[idx] = static_cast<int32_t>(new_comp);
+    return true;
+}
+
+bool SimWorld::water_soil(int32_t x, int32_t y, int64_t amount) {
+    if (x < 0 || x >= _map_width || y < 0 || y >= _map_height) return false;
+    int32_t idx = y * _map_width + x;
+
+    int64_t amt = amount;
+    if (amt <= 0) {
+        amt = 30LL * ONE;
+    } else if (amt > 0 && amt <= 100) {
+        amt = amt * ONE;
+    }
+
+    int64_t new_w = static_cast<int64_t>(_water_table[idx]) + amt;
+    if (new_w > 100LL * ONE) new_w = 100LL * ONE;
+    _water_table[idx] = static_cast<int32_t>(new_w);
+    return true;
+}
+
+bool SimWorld::plant_crop(int32_t x, int32_t y, uint8_t crop_type, uint8_t prefix, uint8_t suffix, uint8_t implicit) {
+    if (x < 0 || x >= _map_width || y < 0 || y >= _map_height) return false;
+    if (crop_type == 0) return false;
+    int32_t idx = y * _map_width + x;
+
+    // Check tilled soil
+    if (_surface_type[idx] != static_cast<uint8_t>(Generation::SurfaceType::TILLED_SOIL)) {
+        return false;
+    }
+
     if (_crop_type[idx] == 0) {
-        // Add to planted index list if it wasn't planted
         _planted_tile_indices.push_back(idx);
         std::sort(_planted_tile_indices.begin(), _planted_tile_indices.end());
     }
@@ -1707,24 +2221,74 @@ void SimWorld::plant_crop(int32_t x, int32_t y, uint8_t crop_type, uint8_t prefi
     _crop_prefix[idx] = prefix;
     _crop_suffix[idx] = suffix;
     _crop_implicit[idx] = implicit;
+    return true;
 }
 
-void SimWorld::harvest_crop(int32_t x, int32_t y) {
-    if (x < 0 || x >= _map_width || y < 0 || y >= _map_height) return;
+bool SimWorld::harvest_crop(int32_t x, int32_t y) {
+    if (x < 0 || x >= _map_width || y < 0 || y >= _map_height) return false;
     int32_t idx = y * _map_width + x;
-    if (_crop_type[idx] != 0) {
-        _crop_type[idx] = 0;
-        _crop_growth[idx] = 0;
-        _crop_health[idx] = 0;
-        _crop_prefix[idx] = 0;
-        _crop_suffix[idx] = 0;
-        _crop_implicit[idx] = 0;
-        // Remove from planted list
-        auto it = std::lower_bound(_planted_tile_indices.begin(), _planted_tile_indices.end(), idx);
-        if (it != _planted_tile_indices.end() && *it == idx) {
-            _planted_tile_indices.erase(it);
-        }
+    if (_crop_type[idx] == 0) return false;
+
+    // Verify crop maturity (crop_growth >= 100 * ONE)
+    if (_crop_growth[idx] < 100 * ONE) return false;
+
+    uint8_t c_type = _crop_type[idx];
+    uint8_t c_pre = _crop_prefix[idx];
+
+    // Clear the crop tile
+    _crop_type[idx] = 0;
+    _crop_growth[idx] = 0;
+    _crop_health[idx] = 0;
+    _crop_prefix[idx] = 0;
+    _crop_suffix[idx] = 0;
+    _crop_implicit[idx] = 0;
+
+    auto it = std::lower_bound(_planted_tile_indices.begin(), _planted_tile_indices.end(), idx);
+    if (it != _planted_tile_indices.end() && *it == idx) {
+        _planted_tile_indices.erase(it);
     }
+
+    // Produce deterministic harvest item drops
+    int64_t cell_sz = _cell_size_fixed > 0 ? _cell_size_fixed : 64LL * ONE;
+    int64_t drop_x = static_cast<int64_t>(x) * cell_sz + (cell_sz / 2);
+    int64_t drop_y = static_cast<int64_t>(y) * cell_sz + (cell_sz / 2);
+
+    uint64_t harvest_seed = (static_cast<uint64_t>(idx) * 73856093ULL) ^
+                            (static_cast<uint64_t>(c_type) * 19349663ULL) ^
+                            (static_cast<uint64_t>(_tick) * 83492791ULL) ^
+                            0x43524F50ULL; // "CROP"
+    if (harvest_seed == 0) harvest_seed = 1;
+    ItemData crop_item = ItemData::generate(harvest_seed);
+
+    EntityID drop_id = spawn_entity(EntityType::ITEM, drop_x, drop_y, 16 * ONE, 1, 0);
+    equip_item(drop_id, 0, harvest_seed);
+    _last_dropped_item = drop_id;
+    _last_generated_item = crop_item;
+
+    if (c_pre == static_cast<uint8_t>(CropPrefix::SUCCULENT_FRUIT)) {
+        uint64_t bonus_seed = harvest_seed ^ 0x5949454C44ULL; // "YIELD"
+        if (bonus_seed == 0) bonus_seed = 2;
+        EntityID bonus_id = spawn_entity(EntityType::ITEM, drop_x + (4 * ONE), drop_y + (4 * ONE), 16 * ONE, 1, 0);
+        equip_item(bonus_id, 0, bonus_seed);
+    }
+
+    return true;
+}
+
+bool SimWorld::is_crop_mature(int32_t x, int32_t y) const {
+    if (x < 0 || x >= _map_width || y < 0 || y >= _map_height) return false;
+    int32_t idx = y * _map_width + x;
+    return (_crop_type[idx] != 0 && _crop_growth[idx] >= 100 * ONE);
+}
+
+int32_t SimWorld::get_soil_moisture(int32_t x, int32_t y) const {
+    if (x < 0 || x >= _map_width || y < 0 || y >= _map_height) return 0;
+    return _water_table[y * _map_width + x];
+}
+
+int32_t SimWorld::get_soil_compactness(int32_t x, int32_t y) const {
+    if (x < 0 || x >= _map_width || y < 0 || y >= _map_height) return 0;
+    return _soil_compactness[y * _map_width + x];
 }
 
 void SimWorld::tick_crops() {
@@ -1732,6 +2296,7 @@ void SimWorld::tick_crops() {
     
     int32_t chunk_w = (_map_width + CHUNK_SIZE - 1) / CHUNK_SIZE;
     int32_t chunk_h = (_map_height + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    if (chunk_w <= 0 || chunk_h <= 0 || _chunk_tiers.size() < (size_t)chunk_w * chunk_h) return;
     size_t total_cells = (size_t)_map_width * _map_height;
     
     // Determine whether to use sparse iteration or dense scan
@@ -2145,6 +2710,118 @@ void SimWorld::place_structure(int32_t x, int32_t y, uint8_t structure_type) {
 
 void SimWorld::remove_structure(int32_t x, int32_t y) {
     _do_remove_structure(x, y);
+}
+
+bool SimWorld::can_modify_terrain(int32_t x, int32_t y) const {
+    if (x < 0 || x >= _map_width || y < 0 || y >= _map_height) {
+        return false;
+    }
+    int32_t idx = y * _map_width + x;
+    if (!_structure_type.empty() && _structure_type[idx] != 0) {
+        return false;
+    }
+
+    if (_cell_size_fixed > 0) {
+        int32_t chunk_w = (_map_width + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        int32_t chunk_h = (_map_height + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        int32_t cx = x / CHUNK_SIZE;
+        int32_t cy = y / CHUNK_SIZE;
+
+        if (!_chunk_trees.empty() && cx >= 0 && cx < chunk_w && cy >= 0 && cy < chunk_h) {
+            const auto& tree_indices = get_trees_in_chunk(cx, cy);
+            for (uint32_t tid : tree_indices) {
+                if (tid < _terrain_trees.size()) {
+                    const auto& tree = _terrain_trees[tid];
+                    if (tree.flags & 1) {
+                        int32_t tree_cell_x = static_cast<int32_t>(tree.x / _cell_size_fixed);
+                        if (tree.x < 0 && tree.x % _cell_size_fixed != 0) tree_cell_x--;
+                        int32_t tree_cell_y = static_cast<int32_t>(tree.z / _cell_size_fixed);
+                        if (tree.z < 0 && tree.z % _cell_size_fixed != 0) tree_cell_y--;
+
+                        if (tree_cell_x == x && tree_cell_y == y) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        } else {
+            for (const auto& tree : _terrain_trees) {
+                if (tree.flags & 1) {
+                    int32_t tree_cell_x = static_cast<int32_t>(tree.x / _cell_size_fixed);
+                    if (tree.x < 0 && tree.x % _cell_size_fixed != 0) tree_cell_x--;
+                    int32_t tree_cell_y = static_cast<int32_t>(tree.z / _cell_size_fixed);
+                    if (tree.z < 0 && tree.z % _cell_size_fixed != 0) tree_cell_y--;
+
+                    if (tree_cell_x == x && tree_cell_y == y) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+bool SimWorld::modify_terrain(int32_t x, int32_t y, int32_t delta_elev) {
+    if (!can_modify_terrain(x, y)) {
+        return false;
+    }
+    int32_t idx = y * _map_width + x;
+    if ((size_t)idx < _elevation.size()) {
+        _elevation[idx] += delta_elev;
+    }
+    return true;
+}
+
+void SimWorld::_do_modify_terrain(int32_t x, int32_t y, int32_t delta_elev) {
+    modify_terrain(x, y, delta_elev);
+}
+
+void SimWorld::set_terrain_trees(const std::vector<TerrainTree>& trees) {
+    _terrain_trees = trees;
+    int32_t chunk_w = (_map_width + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    int32_t chunk_h = (_map_height + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    if (chunk_w > 0 && chunk_h > 0) {
+        _chunk_trees.assign((size_t)chunk_w * chunk_h, {});
+        for (size_t i = 0; i < _terrain_trees.size(); ++i) {
+            const auto& t = _terrain_trees[i];
+            int32_t cx = t.chunk_x;
+            int32_t cy = t.chunk_y;
+            if (_cell_size_fixed > 0 && cx == 0 && cy == 0 && (t.x != 0 || t.z != 0)) {
+                int32_t cell_x = static_cast<int32_t>(t.x / _cell_size_fixed);
+                int32_t cell_y = static_cast<int32_t>(t.z / _cell_size_fixed);
+                cx = cell_x / CHUNK_SIZE;
+                cy = cell_y / CHUNK_SIZE;
+            }
+            if (t.is_alive() && cx >= 0 && cx < chunk_w && cy >= 0 && cy < chunk_h) {
+                _chunk_trees[cy * chunk_w + cx].push_back(static_cast<uint32_t>(i));
+            }
+        }
+    }
+}
+
+void SimWorld::add_terrain_tree(const TerrainTree& tree) {
+    uint32_t idx = static_cast<uint32_t>(_terrain_trees.size());
+    _terrain_trees.push_back(tree);
+    int32_t chunk_w = (_map_width + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    int32_t chunk_h = (_map_height + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    if (chunk_w > 0 && chunk_h > 0) {
+        if (_chunk_trees.size() < (size_t)chunk_w * chunk_h) {
+            _chunk_trees.assign((size_t)chunk_w * chunk_h, {});
+        }
+        int32_t cx = tree.chunk_x;
+        int32_t cy = tree.chunk_y;
+        if (_cell_size_fixed > 0 && cx == 0 && cy == 0 && (tree.x != 0 || tree.z != 0)) {
+            int32_t cell_x = static_cast<int32_t>(tree.x / _cell_size_fixed);
+            int32_t cell_y = static_cast<int32_t>(tree.z / _cell_size_fixed);
+            cx = cell_x / CHUNK_SIZE;
+            cy = cell_y / CHUNK_SIZE;
+        }
+        if (tree.is_alive() && cx >= 0 && cx < chunk_w && cy >= 0 && cy < chunk_h) {
+            _chunk_trees[cy * chunk_w + cx].push_back(idx);
+        }
+    }
 }
 
 void SimWorld::damage_crop(int32_t idx, int32_t amount) {

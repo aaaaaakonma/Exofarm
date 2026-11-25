@@ -26,8 +26,51 @@ FORCE_INLINE int64_t sin_fixed(int64_t x) {
 }
 
 FORCE_INLINE int64_t cos_fixed(int64_t x) {
-    return sin_fixed(x + HALF_PI);
+    return sin_fixed(normalize_angle(x) + HALF_PI);
 }
+
+// ===== 2D Fixed-Point Vector =====
+
+struct Vec2Fixed {
+    int64_t x = 0;
+    int64_t y = 0;
+
+    constexpr Vec2Fixed() = default;
+    constexpr Vec2Fixed(int64_t _x, int64_t _y) : x(_x), y(_y) {}
+
+    FORCE_INLINE Vec2Fixed operator+(const Vec2Fixed& o) const { return {x + o.x, y + o.y}; }
+    FORCE_INLINE Vec2Fixed operator-(const Vec2Fixed& o) const { return {x - o.x, y - o.y}; }
+    FORCE_INLINE Vec2Fixed operator-() const { return {-x, -y}; }
+    FORCE_INLINE Vec2Fixed operator*(int64_t scalar) const { return {mul_fixed(x, scalar), mul_fixed(y, scalar)}; }
+    FORCE_INLINE Vec2Fixed operator/(int64_t scalar) const { if (scalar == 0) return {0, 0}; return {div_fixed(x, scalar), div_fixed(y, scalar)}; }
+
+    FORCE_INLINE int64_t dot(const Vec2Fixed& o) const {
+        return mul_fixed(x, o.x) + mul_fixed(y, o.y);
+    }
+
+    FORCE_INLINE int64_t cross(const Vec2Fixed& o) const {
+        return mul_fixed(x, o.y) - mul_fixed(y, o.x);
+    }
+
+    FORCE_INLINE int64_t length_sq() const {
+        return dot(*this);
+    }
+
+    FORCE_INLINE int64_t length() const {
+        return sqrt_fixed(length_sq());
+    }
+
+    FORCE_INLINE Vec2Fixed normalized() const {
+        int64_t len_sq = length_sq();
+        if (len_sq <= 64) return {0, 0};
+        int64_t inv_len = inv_sqrt_fixed(len_sq);
+        return (*this) * inv_len;
+    }
+
+    FORCE_INLINE Vec2Fixed perpendicular() const {
+        return {-y, x};
+    }
+};
 
 // ===== 3D Vector =====
 
@@ -40,7 +83,7 @@ struct Vec3Fixed {
     Vec3Fixed operator+(const Vec3Fixed& o) const { return {x + o.x, y + o.y, z + o.z}; }
     Vec3Fixed operator-(const Vec3Fixed& o) const { return {x - o.x, y - o.y, z - o.z}; }
     Vec3Fixed operator*(int64_t scalar) const { return {mul_fixed(x, scalar), mul_fixed(y, scalar), mul_fixed(z, scalar)}; }
-    Vec3Fixed operator/(int64_t scalar) const { return {div_fixed(x, scalar), div_fixed(y, scalar), div_fixed(z, scalar)}; }
+    Vec3Fixed operator/(int64_t scalar) const { if (scalar == 0) return {0, 0, 0}; return {div_fixed(x, scalar), div_fixed(y, scalar), div_fixed(z, scalar)}; }
 
     int64_t dot(const Vec3Fixed& o) const {
         return mul_fixed(x, o.x) + mul_fixed(y, o.y) + mul_fixed(z, o.z);
@@ -64,7 +107,7 @@ struct Vec3Fixed {
 
     Vec3Fixed normalized() const {
         int64_t len_sq = length_sq();
-        if (len_sq == 0) return {0, 0, 0};
+        if (len_sq <= 64) return {0, 0, 0};
         int64_t inv_len = inv_sqrt_fixed(len_sq);
         return (*this) * inv_len;
     }

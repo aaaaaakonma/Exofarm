@@ -9,12 +9,17 @@ This file provides an overview of the directories and files within the ExoFarm d
 ```
 E:/exofarm/exofarm/
 ├── src/                      # Core engine source files
-│   ├── core/                 # Core engine systems, collision, items, and farming simulation
-│   ├── entities/             # Game entities (Player, Enemy, Wall)
-│   ├── math/                 # Deterministic math utilities (fixed point, CORDIC, RNG)
-│   └── gdextension/          # Godot C++ GDExtension bindings
-├── test_determinism.cpp      # Standalone headless verification tool (runs lockstep simulation check)
-├── test_biomes.cpp           # Headless biome distribution analyzer
+│   ├── core/                 # Core engine systems, tectonics, hydrology, erosion, botanical trees, farming
+│   ├── entities/             # Game entities (Player)
+│   ├── math/                 # Deterministic math utilities (16.16 fixed-point, noise, bicubic, RNG)
+│   ├── gdextension/          # Godot C++ GDExtension bindings (SimBridge, BotanicalTreeBridge)
+│   └── tests/                # Core unit tests (test_fixed_3d.cpp)
+├── scenes/visualizers/       # Diagnostic 2D & 3D Godot visualizer scenes
+├── scripts/                  # Shared GDScript presentation/component helpers
+├── tests/                    # Headless C++ (tests/cpp/) & Godot (tests/gd/) verification suites
+├── tools/                    # Asset synthesis, wave cage export, and QC capture tools
+├── main.tscn / main.gd       # Main 3D traversal & gameplay entry scene
+├── exofarm.gdextension       # GDExtension manifest (bin/libexofarm.*)
 └── SConstruct                # SCons build configuration
 ```
 

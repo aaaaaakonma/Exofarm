@@ -2,79 +2,199 @@
 class_name WaveComputeDriver
 extends Node
 
-## Hosts the wave cage compute pipeline (Jeschke et al. 2020).
-## On _ready() it compiles the shader and sets up all Vulkan resources.
-## On _process() it updates time + wave params and dispatches the compute pass.
-##
-## Assign static_cage_texture (baked by wave_cage_baker.gd) and
-## heightmap_texture (same heightmap used by the terrain shader) before entering
-## the scene tree, or the compute pass will be skipped with an error.
+## Hosts the Yuksel (2007) Wave Particle Simulation on Jeschke Boundary Wave Cages.
+## Discrete 2D wave packet particles propagate across the ocean, shoal and slow down
+## in shallow waters, reflect off coastal boundaries, and deform the water grid.
 
 @export var static_cage_texture: Texture2D
-@export var heightmap_texture: Texture2D   ## Same heightmap used by the terrain — needed for terrain-normal reconstruction in the shader.
+@export var heightmap_texture: Texture2D
 @export var grid_size: int = 512
-@export var cage_softness: float = 0.5
-@export var world_size: float = 512.0
-@export var height_scale_factor: float = 100.0   ## Must match wave_cage_baker.gd / terrain shader.
-@export var sea_level_normalized: float = 0.5    ## Must match wave_cage_baker.gd.
+@export var cage_softness: float = 6.0  ## Jeschke §4 tanh sharpness — must be >> 1 to preserve displacement inside cage
+@export var world_size: float = 1024.0
+@export var height_scale_factor: float = 1.0
+@export var sea_level_normalized: float = 0.0
 
 @export var target_material: ShaderMaterial
 
-# Output Texture2DRD objects exposed to the spatial shader.
+# Maximum simultaneous wave particles in GPU storage buffer
+const MAX_PARTICLES: int = 512
+const PARTICLE_STRIDE: int = 64 # bytes per WaveParticle struct in std430
+
+# Output Texture2DRD objects exposed to the spatial water shader
 var displacement_texture: Texture2DRD
 var normal_texture: Texture2DRD
 
-# ---------- Vulkan / RD resources ----------
+# Vulkan / RenderingDevice resources
 var rd: RenderingDevice
 var shader: RID
 var pipeline: RID
 
 var out_disp_tex: RID
 var out_norm_tex: RID
-var cage_tex_rid: RID   # tracked for cleanup (was leaked before)
-var hm_tex_rid: RID     # heightmap RD texture (tracked for cleanup)
-var sampler_rid: RID    # shared linear sampler (tracked for cleanup)
+var cage_tex_rid: RID
+var hm_tex_rid: RID
+var sampler_rid: RID
 
-var uniform_set_0: RID  # output image2Ds
-var uniform_set_1: RID  # cage tex + heightmap tex
-var uniform_set_2: RID  # params UBO
-var uniform_set_3: RID  # wave SSBO
+var uniform_set_0: RID # output images
+var uniform_set_1: RID # cage tex + heightmap tex
+var uniform_set_2: RID # params UBO
+var uniform_set_3: RID # particle SSBO
 
 var params_buffer: RID
 var wave_buffer: RID
 
 var time: float = 0.0
+var global_amplitude_mult: float = 1.0
 
-# ---------- Wave definition ----------
-class WaveDef:
-	var dir: Vector2
-	var amplitude: float
-	var frequency: float
-	var speed: float
-	var phase: float
-	var steepness: float = 0.5   # Gerstner Q parameter, was missing before
+# Cached CPU-side image for instant boundary lookups (reflections & shoaling)
+var cached_cage_image: Image
+var cached_hm_image: Image
 
-var waves: Array[WaveDef] = []
+# ---------- Wave Particle Definition ----------
+class WaveParticle:
+	var pos: Vector2 = Vector2.ZERO         # world x, z
+	var dir: Vector2 = Vector2(1.0, 0.0)    # normalized direction
+	var speed: float = 24.0                 # propagation velocity (m/s)
+	var amplitude: float = 1.6              # wave packet height (m)
+	var radius: float = 30.0                # kernel influence radius (m)
+	var wavelength: float = 20.0            # carrier wavelength (m)
+	var age: float = 0.0                    # current lifetime (s)
+	var lifetime: float = 14.0              # total lifespan (s)
+	var steepness: float = 0.5              # Gerstner Q horizontal choppiness
+	var active: bool = false
+	var is_ambient: bool = false
 
+var particles: Array[WaveParticle] = []
+var ambient_timer: float = 0.0
+
+# Compatibility mock for existing wave controls
+class MockWave:
+	var amplitude: float = 1.0
+var waves: Array[MockWave] = []
 
 func _ready() -> void:
-	_init_waves()
+	_init_particles()
 	if static_cage_texture and heightmap_texture:
 		_init_compute()
 
-
-func _init_waves() -> void:
-	# Four overlapping Gerstner waves at varied directions and frequencies.
+func _init_particles() -> void:
+	particles.clear()
+	for i in range(MAX_PARTICLES):
+		particles.append(WaveParticle.new())
+	
+	# Compatibility mock
+	waves.clear()
 	for i in range(4):
-		var w := WaveDef.new()
-		w.dir       = Vector2(cos(i * 0.7 + 0.3), sin(i * 0.7 + 0.3)).normalized()
-		w.amplitude = 2.0 / (i + 1)
-		w.frequency = 0.1 * (i + 1)
-		w.speed     = 1.0 * (i + 1)
-		w.phase     = i * 0.5
-		w.steepness = 0.5
-		waves.append(w)
+		waves.append(MockWave.new())
+	
+	# Seed initial ambient ocean swell particles across the map
+	_seed_ambient_swells()
 
+func _seed_ambient_swells() -> void:
+	# Populate open ocean regions with rolling swell particle wavefronts
+	var main_dir = Vector2(0.85, 0.52).normalized()
+	for row in range(5):
+		var base_dist = float(row) * (world_size * 0.22)
+		for col in range(8):
+			var perp = Vector2(-main_dir.y, main_dir.x)
+			var offset = (float(col) - 3.5) * 110.0
+			var spawn_p = main_dir * base_dist + perp * offset
+			spawn_p.x = fposmod(spawn_p.x, world_size)
+			spawn_p.y = fposmod(spawn_p.y, world_size)
+			
+			var p = _alloc_particle()
+			if p:
+				p.pos = spawn_p
+				p.dir = main_dir
+				p.speed = 22.0 + randf_range(-2.0, 2.0)
+				p.amplitude = 1.4 * global_amplitude_mult
+				p.radius = 45.0 + randf_range(-5.0, 10.0)
+				p.wavelength = 28.0 + randf_range(-4.0, 4.0)
+				p.age = randf_range(0.0, 8.0)
+				p.lifetime = 24.0
+				p.steepness = 0.55
+				p.active = true
+				p.is_ambient = true
+
+func _alloc_particle() -> WaveParticle:
+	for p in particles:
+		if not p.active:
+			return p
+	# Recycle the oldest particle if pool is exhausted
+	var oldest: WaveParticle = particles[0]
+	for p in particles:
+		if p.age > oldest.age:
+			oldest = p
+	return oldest
+
+func spawn_particle(
+	pos: Vector2,
+	dir: Vector2,
+	speed: float,
+	amp: float,
+	radius: float,
+	wavelength: float,
+	lifetime: float = 12.0,
+	steepness: float = 0.5,
+	is_ambient: bool = false
+) -> WaveParticle:
+	var p = _alloc_particle()
+	if p:
+		p.pos = pos
+		p.dir = dir.normalized()
+		p.speed = speed
+		p.amplitude = amp * global_amplitude_mult
+		p.radius = radius
+		p.wavelength = wavelength
+		p.age = 0.0
+		p.lifetime = lifetime
+		p.steepness = steepness
+		p.active = true
+		p.is_ambient = is_ambient
+	return p
+
+## Spawns a radial disturbance of wave particles expanding outward in a circular ring
+func spawn_ripple(
+	center_pos: Vector2,
+	count: int = 16,
+	amplitude: float = 1.8,
+	radius: float = 24.0,
+	speed: float = 22.0,
+	wavelength: float = 14.0,
+	lifetime: float = 9.0
+) -> void:
+	var angle_step = TAU / float(count)
+	for i in range(count):
+		var angle = float(i) * angle_step + randf_range(-0.1, 0.1)
+		var dir = Vector2(cos(angle), sin(angle))
+		var start_p = center_pos + dir * 4.0
+		spawn_particle(start_p, dir, speed, amplitude, radius, wavelength, lifetime, 0.5, false)
+
+## Spawns a planar wavefront of ocean swell wave particles traveling in dir
+func spawn_ocean_swell(
+	dir: Vector2 = Vector2(0.8, 0.6),
+	count: int = 10,
+	amplitude: float = 2.0,
+	radius: float = 55.0,
+	speed: float = 24.0,
+	wavelength: float = 35.0
+) -> void:
+	var norm_dir = dir.normalized()
+	var perp = Vector2(-norm_dir.y, norm_dir.x)
+	var start_base = Vector2.ZERO if norm_dir.x > 0 else Vector2(world_size, 0)
+	for i in range(count):
+		var offset = float(i) * (world_size / float(count))
+		var p_pos = start_base + perp * offset
+		p_pos.x = fposmod(p_pos.x, world_size)
+		p_pos.y = fposmod(p_pos.y, world_size)
+		spawn_particle(p_pos, norm_dir, speed, amplitude, radius, wavelength, 25.0, 0.55, true)
+
+func update_waves() -> void:
+	if not waves.is_empty():
+		global_amplitude_mult = waves[0].amplitude / 2.0
+		for p in particles:
+			if p.active and p.is_ambient:
+				p.amplitude = 1.4 * global_amplitude_mult
 
 func _init_compute() -> void:
 	if not static_cage_texture or not heightmap_texture:
@@ -85,22 +205,30 @@ func _init_compute() -> void:
 		printerr("WaveComputeDriver: Compute shaders not supported on this renderer.")
 		return
 
-	# ---- 1. Compile shader + create pipeline ----
-	var shader_file  = load("res://assets/shaders/wave_compute.glsl")
+	cached_cage_image = static_cage_texture.get_image()
+
+	# 1. Compile Wave Particle Compute Shader
+	var shader_file = load("res://assets/shaders/wave_compute.glsl")
 	var spirv: RDShaderSPIRV = shader_file.get_spirv()
-	var shader_res   = rd.shader_create_from_spirv(spirv)
+	var shader_res = rd.shader_create_from_spirv(spirv)
+	if not shader_res.is_valid():
+		var err = spirv.get_stage_compile_error(RenderingDevice.SHADER_STAGE_COMPUTE)
+		printerr("WaveComputeDriver: Compute shader compilation failed: ", err)
+		return
 	shader = shader_res
 	pipeline = rd.compute_pipeline_create(shader)
 
-	# ---- 2. Output textures (displacement + normal) ----
+	# 2. Output Textures (Displacement + Normal)
 	var fmt := RDTextureFormat.new()
-	fmt.width  = grid_size
+	fmt.width = grid_size
 	fmt.height = grid_size
 	fmt.format = RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT
-	fmt.usage_bits = (RenderingDevice.TEXTURE_USAGE_CAN_UPDATE_BIT
-					| RenderingDevice.TEXTURE_USAGE_STORAGE_BIT
-					| RenderingDevice.TEXTURE_USAGE_CAN_COPY_FROM_BIT
-					| RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT)
+	fmt.usage_bits = (
+		RenderingDevice.TEXTURE_USAGE_CAN_UPDATE_BIT
+		| RenderingDevice.TEXTURE_USAGE_STORAGE_BIT
+		| RenderingDevice.TEXTURE_USAGE_CAN_COPY_FROM_BIT
+		| RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
+	)
 
 	out_disp_tex = rd.texture_create(fmt, RDTextureView.new())
 	out_norm_tex = rd.texture_create(fmt, RDTextureView.new())
@@ -113,11 +241,10 @@ func _init_compute() -> void:
 
 	if target_material:
 		target_material.set_shader_parameter("displacement_tex", displacement_texture)
-		target_material.set_shader_parameter("normal_tex",       normal_texture)
-		# Also wire the heightmap so the spatial shader can do terrain clipping.
+		target_material.set_shader_parameter("normal_tex", normal_texture)
 		target_material.set_shader_parameter("heightmap_tex", heightmap_texture)
 
-	# ---- 3. Uniform Set 0 — output image2Ds ----
+	# 3. Uniform Set 0 — Output image2Ds
 	var u_disp := RDUniform.new()
 	u_disp.uniform_type = RenderingDevice.UNIFORM_TYPE_IMAGE
 	u_disp.binding = 0
@@ -130,23 +257,25 @@ func _init_compute() -> void:
 
 	uniform_set_0 = rd.uniform_set_create([u_disp, u_norm], shader, 0)
 
-	# ---- 4. Shared linear sampler (clamp-to-edge) ----
+	# 4. Shared Linear Sampler
 	var ss := RDSamplerState.new()
 	ss.mag_filter = RenderingDevice.SAMPLER_FILTER_LINEAR
 	ss.min_filter = RenderingDevice.SAMPLER_FILTER_LINEAR
-	ss.repeat_u   = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
-	ss.repeat_v   = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
+	ss.repeat_u = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
+	ss.repeat_v = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
 	sampler_rid = rd.sampler_create(ss)
 
-	# ---- 5. Cage texture (set=1, binding=0) ----
+	# 5. Cage Texture (Set 1, Binding 0)
 	var cage_img := static_cage_texture.get_image()
 	cage_img.convert(Image.FORMAT_RGBAF)
 	var cage_fmt := RDTextureFormat.new()
-	cage_fmt.width  = cage_img.get_width()
+	cage_fmt.width = cage_img.get_width()
 	cage_fmt.height = cage_img.get_height()
 	cage_fmt.format = RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT
-	cage_fmt.usage_bits = (RenderingDevice.TEXTURE_USAGE_CAN_UPDATE_BIT
-						 | RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT)
+	cage_fmt.usage_bits = (
+		RenderingDevice.TEXTURE_USAGE_CAN_UPDATE_BIT
+		| RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
+	)
 	cage_tex_rid = rd.texture_create(cage_fmt, RDTextureView.new(), [cage_img.get_data()])
 
 	var u_cage := RDUniform.new()
@@ -155,16 +284,18 @@ func _init_compute() -> void:
 	u_cage.add_id(sampler_rid)
 	u_cage.add_id(cage_tex_rid)
 
-	# ---- 6. Heightmap texture (set=1, binding=1) ----
+	# 6. Heightmap Texture (Set 1, Binding 1)
 	var hm_img := heightmap_texture.get_image()
 	hm_img.decompress()
-	hm_img.convert(Image.FORMAT_RGBAF)
+	hm_img.convert(Image.FORMAT_RF)
 	var hm_fmt := RDTextureFormat.new()
-	hm_fmt.width  = hm_img.get_width()
+	hm_fmt.width = hm_img.get_width()
 	hm_fmt.height = hm_img.get_height()
-	hm_fmt.format = RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT
-	hm_fmt.usage_bits = (RenderingDevice.TEXTURE_USAGE_CAN_UPDATE_BIT
-					   | RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT)
+	hm_fmt.format = RenderingDevice.DATA_FORMAT_R32_SFLOAT
+	hm_fmt.usage_bits = (
+		RenderingDevice.TEXTURE_USAGE_CAN_UPDATE_BIT
+		| RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
+	)
 	hm_tex_rid = rd.texture_create(hm_fmt, RDTextureView.new(), [hm_img.get_data()])
 
 	var u_hm := RDUniform.new()
@@ -175,8 +306,7 @@ func _init_compute() -> void:
 
 	uniform_set_1 = rd.uniform_set_create([u_cage, u_hm], shader, 1)
 
-	# ---- 7. Params UBO (set=2) — 32 bytes, 8 floats ----
-	# Layout matches the WaveParams uniform block in wave_compute.glsl.
+	# 7. Params UBO (Set 2) — 32 bytes
 	var pb := PackedByteArray()
 	pb.resize(32)
 	params_buffer = rd.uniform_buffer_create(pb.size(), pb)
@@ -187,90 +317,183 @@ func _init_compute() -> void:
 	u_params.add_id(params_buffer)
 	uniform_set_2 = rd.uniform_set_create([u_params], shader, 2)
 
-	# ---- 8. Wave SSBO (set=3) — 32 bytes per Wave struct ----
-	# Layout: vec2 dir (8), float amplitude (4), frequency (4), speed (4),
-	#         phase (4), steepness (4), padding (4) = 32 bytes.
-	const WAVE_STRIDE := 32
-	var wave_bytes := PackedByteArray()
-	wave_bytes.resize(waves.size() * WAVE_STRIDE)  # zero-initialised (padding safe)
+	# 8. Wave Particle SSBO (Set 3) — 64 bytes per Particle
+	var particle_bytes := PackedByteArray()
+	particle_bytes.resize(MAX_PARTICLES * PARTICLE_STRIDE)
+	wave_buffer = rd.storage_buffer_create(particle_bytes.size(), particle_bytes)
 
-	for i in range(waves.size()):
-		var w   := waves[i]
-		var off := i * WAVE_STRIDE
-		wave_bytes.encode_float(off + 0,  w.dir.x)
-		wave_bytes.encode_float(off + 4,  w.dir.y)
-		wave_bytes.encode_float(off + 8,  w.amplitude)
-		wave_bytes.encode_float(off + 12, w.frequency)
-		wave_bytes.encode_float(off + 16, w.speed)
-		wave_bytes.encode_float(off + 20, w.phase)
-		wave_bytes.encode_float(off + 24, w.steepness)
-		# off + 28 = padding, already 0 from resize()
-
-	wave_buffer = rd.storage_buffer_create(wave_bytes.size(), wave_bytes)
-
-	var u_waves := RDUniform.new()
-	u_waves.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
-	u_waves.binding = 0
-	u_waves.add_id(wave_buffer)
-	uniform_set_3 = rd.uniform_set_create([u_waves], shader, 3)
-
-
-func update_waves() -> void:
-	if not rd or not wave_buffer.is_valid():
-		return
-	const WAVE_STRIDE := 32
-	var wave_bytes := PackedByteArray()
-	wave_bytes.resize(waves.size() * WAVE_STRIDE)
-	for i in range(waves.size()):
-		var w   := waves[i]
-		var off := i * WAVE_STRIDE
-		wave_bytes.encode_float(off + 0,  w.dir.x)
-		wave_bytes.encode_float(off + 4,  w.dir.y)
-		wave_bytes.encode_float(off + 8,  w.amplitude)
-		wave_bytes.encode_float(off + 12, w.frequency)
-		wave_bytes.encode_float(off + 16, w.speed)
-		wave_bytes.encode_float(off + 20, w.phase)
-		wave_bytes.encode_float(off + 24, w.steepness)
-	rd.buffer_update(wave_buffer, 0, wave_bytes.size(), wave_bytes)
-
+	var u_part := RDUniform.new()
+	u_part.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
+	u_part.binding = 0
+	u_part.add_id(wave_buffer)
+	uniform_set_3 = rd.uniform_set_create([u_part], shader, 3)
 
 func _process(delta: float) -> void:
 	if not rd or not pipeline.is_valid():
 		return
 
 	time += delta
+	ambient_timer += delta
 
-	# Update params UBO — 32 bytes matching WaveParams in wave_compute.glsl.
+	# Periodically respawn ambient swell wavefronts from ocean borders
+	if ambient_timer > 6.0:
+		ambient_timer = 0.0
+		spawn_ocean_swell(Vector2(0.85, 0.45), 6, 1.8, 55.0, 24.0, 32.0)
+
+	# 1. Physical Wave Particle Simulation Step (Advection, Shoaling & Coastal Reflection)
+	_step_particles(delta)
+
+	# 2. Pack Active Particle Buffer to GPU SSBO
+	var particle_bytes := PackedByteArray()
+	particle_bytes.resize(MAX_PARTICLES * PARTICLE_STRIDE)
+	var active_count: int = 0
+
+	for i in range(MAX_PARTICLES):
+		var p = particles[i]
+		var off = i * PARTICLE_STRIDE
+		if p.active:
+			active_count += 1
+			particle_bytes.encode_float(off + 0,  p.pos.x)
+			particle_bytes.encode_float(off + 4,  p.pos.y)
+			particle_bytes.encode_float(off + 8,  p.dir.x)
+			particle_bytes.encode_float(off + 12, p.dir.y)
+			particle_bytes.encode_float(off + 16, p.speed)
+			particle_bytes.encode_float(off + 20, p.amplitude)
+			particle_bytes.encode_float(off + 24, p.radius)
+			particle_bytes.encode_float(off + 28, p.wavelength)
+			particle_bytes.encode_float(off + 32, p.age)
+			particle_bytes.encode_float(off + 36, p.lifetime)
+			particle_bytes.encode_float(off + 40, p.steepness)
+			particle_bytes.encode_float(off + 44, 1.0)
+		else:
+			particle_bytes.encode_float(off + 44, 0.0)
+
+	rd.buffer_update(wave_buffer, 0, particle_bytes.size(), particle_bytes)
+
+	# 3. Update Params UBO
 	var pb := PackedByteArray()
 	pb.resize(32)
 	pb.encode_float(0,  time)
 	pb.encode_float(4,  cage_softness)
-	pb.encode_s32(8,    waves.size())
+	pb.encode_s32(8,    active_count)
 	pb.encode_float(12, world_size)
 	pb.encode_float(16, height_scale_factor)
 	pb.encode_float(20, sea_level_normalized)
-	# bytes 24-31 = padding, left as 0
 	rd.buffer_update(params_buffer, 0, pb.size(), pb)
 
-	# Dispatch.
+	# 4. Dispatch Wave Particle Raster / Splatting Compute Pass
 	var compute_list := rd.compute_list_begin()
 	rd.compute_list_bind_compute_pipeline(compute_list, pipeline)
 	rd.compute_list_bind_uniform_set(compute_list, uniform_set_0, 0)
 	rd.compute_list_bind_uniform_set(compute_list, uniform_set_1, 1)
 	rd.compute_list_bind_uniform_set(compute_list, uniform_set_2, 2)
 	rd.compute_list_bind_uniform_set(compute_list, uniform_set_3, 3)
-	# Fix: ceil() returns float in GDScript — cast to int for the RD API.
+
 	var groups_x := int(ceil(float(grid_size) / 16.0))
 	var groups_y := int(ceil(float(grid_size) / 16.0))
 	rd.compute_list_dispatch(compute_list, groups_x, groups_y, 1)
 	rd.compute_list_end()
 
+func _step_particles(delta: float) -> void:
+	var cage_w = cached_cage_image.get_width() if cached_cage_image else 0
+	var cage_h = cached_cage_image.get_height() if cached_cage_image else 0
+
+	for p in particles:
+		if not p.active:
+			continue
+
+		p.age += delta
+		if p.age >= p.lifetime or abs(p.amplitude) < 0.01:
+			if p.is_ambient:
+				# Respawn ambient ocean swell at deep water border
+				p.pos = Vector2(randf_range(0.0, world_size * 0.3), randf_range(0.0, world_size))
+				p.dir = Vector2(0.85, 0.52).normalized()
+				p.amplitude = 1.4 * global_amplitude_mult
+				p.speed = 22.0 + randf_range(-2.0, 2.0)
+				p.age = 0.0
+			else:
+				p.active = false
+				continue
+
+		# Position Advection
+		p.pos += p.dir * p.speed * delta
+
+		# Toroidal World Boundary Wrapping
+		if p.pos.x < 0.0: p.pos.x += world_size
+		elif p.pos.x >= world_size: p.pos.x -= world_size
+		if p.pos.y < 0.0: p.pos.y += world_size
+		elif p.pos.y >= world_size: p.pos.y -= world_size
+
+		# Coastal Reflection, Estuary Outflow Plume & Shallow Water Shoaling
+		if cage_w > 0 and cage_h > 0:
+			var u = clamp(p.pos.x / world_size, 0.0, 1.0)
+			var v = clamp(p.pos.y / world_size, 0.0, 1.0)
+			var px = int(u * float(cage_w - 1))
+			var py = int(v * float(cage_h - 1))
+			var cage_sample = cached_cage_image.get_pixel(px, py)
+
+			var r1 = cage_sample.r # Distance to nearest shore [metres]
+			var r3 = cage_sample.b # Water depth [metres]
+			var shore_angle = cage_sample.a # Angle toward shore
+
+			# Estuary Plume & Fluvial Barrier Sample
+			if cached_hm_image:
+				var hx = clampi(int(u * float(cached_hm_image.get_width() - 1)), 0, cached_hm_image.get_width() - 1)
+				var hy = clampi(int(v * float(cached_hm_image.get_height() - 1)), 0, cached_hm_image.get_height() - 1)
+				var hm_sample = cached_hm_image.get_pixel(hx, hy)
+				var boundary_mask = hm_sample.g
+				var plume_vel = Vector2(hm_sample.b, hm_sample.a)
+
+				# 1. Estuary Absorbing Gate: If wave packet enters an inland river channel or estuary boundary
+				if boundary_mask > 0.5:
+					p.amplitude *= exp(-18.0 * delta)
+					if abs(p.amplitude) < 0.02:
+						p.active = false
+						continue
+
+				# 2. Wave-Current Interaction in River Plume:
+				var plume_speed = plume_vel.length()
+				if plume_speed > 0.05:
+					# Opposing current (plume flows seaward against wave heading landward)
+					var opp_flow = -p.dir.dot(plume_vel.normalized()) * plume_speed
+					if opp_flow > 0.1:
+						# Opposing flow retards wave velocity and steepens wave profile
+						p.speed = max(4.0, p.speed - opp_flow * 2.5 * delta)
+						p.steepness = min(1.0, p.steepness + opp_flow * 0.4 * delta)
+						# Whitecap wave breaking dissipation on the estuary bar
+						p.amplitude *= exp(-opp_flow * 1.6 * delta)
+
+			if r3 < 0.15:
+				# Reached dry beach or land: rapidly dissipate wave packet
+				p.amplitude *= exp(-9.0 * delta)
+			else:
+				# Shallow water shoaling: velocity decreases with sqrt(depth)
+				var depth_clamped = clamp(r3 / 18.0, 0.12, 1.0)
+				var target_speed = 24.0 * sqrt(depth_clamped)
+				p.speed = lerp(p.speed, target_speed, 4.0 * delta)
+
+				# Coastal Shoaling & Boundary Cage Absorption (Jeschke 2020)
+				# Waves do NOT bounce off coast like billiard balls; they shoal, refract toward the coast,
+				# and their displacement is absorbed and smoothly damped by the boundary cage into the shoreline.
+				if r1 < p.radius * 0.70:
+					var shore_normal = Vector2(-cos(shore_angle), -sin(shore_angle))
+					var coast_dir = -shore_normal # points directly toward the coast
+					p.dir = p.dir.lerp(coast_dir, 2.8 * delta).normalized()
+					# Boundary cage absorption and dissipation in surf zone
+					var surf_prox = 1.0 - (r1 / (p.radius * 0.70))
+					p.amplitude *= exp(-2.5 * surf_prox * delta)
+
+		# Gradual natural wave packet damping
+		p.amplitude *= exp(-0.06 * delta)
 
 func update_textures(new_cage_tex: Texture2D, new_heightmap_tex: Texture2D) -> void:
 	static_cage_texture = new_cage_tex
 	heightmap_texture = new_heightmap_tex
 	if new_cage_tex:
 		grid_size = new_cage_tex.get_width()
+		cached_cage_image = new_cage_tex.get_image()
+	if new_heightmap_tex:
+		cached_hm_image = new_heightmap_tex.get_image()
 	_cleanup_resources()
 	_init_compute()
 

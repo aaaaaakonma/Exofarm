@@ -24,18 +24,33 @@ float get_depth(ivec2 p) {
 	if (p.x < 0 || p.x >= pc.grid_size || p.y < 0 || p.y >= pc.grid_size) return 100.0;
 	vec2 uv = (vec2(p) + 0.5) / float(pc.grid_size);
 	float h = texture(heightmap_tex, uv).r; // Direct physical meters
-	return -h; // Sea level is 0.0m, water depth is -h
+	return pc.sea_level - h; // Positive depth when below sea level
+}
+
+bool is_solid_boundary(ivec2 p) {
+	if (p.x < 0 || p.x >= pc.grid_size || p.y < 0 || p.y >= pc.grid_size) return false;
+	vec2 uv = (vec2(p) + 0.5) / float(pc.grid_size);
+	vec4 data = texture(heightmap_tex, uv);
+	float h = data.r;
+	float boundary_mask = data.g;
+	// Solid boundary if elevation >= sea_level OR if flagged as inland river channel / estuary barrier
+	return (h >= pc.sea_level) || (boundary_mask > 0.5);
 }
 
 void pass_init(ivec2 pos) {
-	float d = get_depth(pos);
-	if (d <= 0.0) {
-		// Land. Check if it's a shoreline (adjacent to water).
+	bool solid = is_solid_boundary(pos);
+	if (solid) {
+		// Land or inland river channel. Check if it's a shoreline (adjacent to open ocean water).
 		bool is_shore = false;
-		if (get_depth(pos + ivec2(1, 0)) > 0.0) is_shore = true;
-		if (get_depth(pos + ivec2(-1, 0)) > 0.0) is_shore = true;
-		if (get_depth(pos + ivec2(0, 1)) > 0.0) is_shore = true;
-		if (get_depth(pos + ivec2(0, -1)) > 0.0) is_shore = true;
+		// 8-connected neighborhood: catches diagonal coastlines for accurate JFA seeding.
+		if (!is_solid_boundary(pos + ivec2( 1,  0))) is_shore = true;
+		if (!is_solid_boundary(pos + ivec2(-1,  0))) is_shore = true;
+		if (!is_solid_boundary(pos + ivec2( 0,  1))) is_shore = true;
+		if (!is_solid_boundary(pos + ivec2( 0, -1))) is_shore = true;
+		if (!is_solid_boundary(pos + ivec2( 1,  1))) is_shore = true;
+		if (!is_solid_boundary(pos + ivec2(-1,  1))) is_shore = true;
+		if (!is_solid_boundary(pos + ivec2( 1, -1))) is_shore = true;
+		if (!is_solid_boundary(pos + ivec2(-1, -1))) is_shore = true;
 
 		if (is_shore) {
 			// XY = seed coords, Z = distance
@@ -44,7 +59,7 @@ void pass_init(ivec2 pos) {
 			imageStore(image_out, pos, vec4(-1.0, -1.0, 999999.0, 0.0));
 		}
 	} else {
-		// Water pixels start with no seed.
+		// Ocean water pixels start with no seed.
 		imageStore(image_out, pos, vec4(-1.0, -1.0, 999999.0, 0.0));
 	}
 }
@@ -82,7 +97,7 @@ float raycast(vec2 start_pos, vec2 dir) {
 		if (ip.x < 0 || ip.x >= pc.grid_size || ip.y < 0 || ip.y >= pc.grid_size) {
 			return float(pc.max_steps) * pc.world_dx;
 		}
-		if (get_depth(ip) <= 0.0) {
+		if (is_solid_boundary(ip)) {
 			return float(i) * pc.world_dx;
 		}
 	}
@@ -90,12 +105,13 @@ float raycast(vec2 start_pos, vec2 dir) {
 }
 
 void pass_radii(ivec2 pos) {
-	float d = get_depth(pos);
-	if (d <= 0.0) {
-		// Land / waterline Dirichlet condition: radii = 0
+	if (is_solid_boundary(pos)) {
+		// Land / inland river / waterline Dirichlet condition: radii = 0
 		imageStore(image_out, pos, vec4(0.0));
 		return;
 	}
+
+	float d = max(0.0, get_depth(pos));
 
 	vec4 jfa_data = imageLoad(image_in, pos);
 	vec2 seed = jfa_data.xy;
@@ -121,7 +137,9 @@ void pass_radii(ivec2 pos) {
 
 	float r2p = raycast(vec2(pos), perp);
 	float r2n = raycast(vec2(pos), -perp);
-	float r2 = clamp(min(r2p, r2n), 0.0, pc.max_radius);
+	// Use half the total channel width for symmetric ellipsoidal cage freedom,
+	// rather than min() which over-constricts asymmetric bay mouths.
+	float r2 = clamp(0.5 * (r2p + r2n), 0.0, pc.max_radius);
 
 	// r3: depth constraint
 	float r3 = clamp(d, 0.0, pc.max_radius);
@@ -130,8 +148,7 @@ void pass_radii(ivec2 pos) {
 }
 
 void pass_blur(ivec2 pos) {
-	float d = get_depth(pos);
-	if (d <= 0.0) {
+	if (is_solid_boundary(pos)) {
 		imageStore(image_out, pos, vec4(0.0));
 		return;
 	}

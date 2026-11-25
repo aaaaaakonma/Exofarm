@@ -1,6 +1,17 @@
 #[compute]
 #version 450
 
+// ----------------------------------------------------------------------
+// ExoFarm: Yuksel (2007) Wave Particle Simulation on Boundary Wave Cages
+// Evaluates discrete wave packet particles on GPU:
+// - Hann window compact radial kernel envelope
+// - Longitudinal wave carrier oscillation
+// - Gerstner-style horizontal peaking (trochoidal sharpening)
+// - Analytic surface normal derivation
+// - Vertical acceleration calculation for breaking whitecap trigger
+// - Jeschke 2020 Ellipsoidal Boundary Cage soft-clipping
+// ----------------------------------------------------------------------
+
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 // ---------- Outputs ----------
@@ -15,14 +26,14 @@ layout(rgba32f, set = 0, binding = 1) uniform image2D out_normal;
 //   A = shore_angle : atan2 direction toward nearest shore in XZ
 layout(set = 1, binding = 0) uniform sampler2D static_cage_tex;
 
-// Terrain heightmap — sampled to reconstruct the seafloor surface normal (a3).
+// Terrain heightmap — sampled to reconstruct seafloor surface normal (a3)
 layout(set = 1, binding = 1) uniform sampler2D heightmap_tex;
 
 // Wave parameters UBO (32 bytes, std140).
 layout(set = 2, binding = 0) uniform WaveParams {
     float time;
-    float cage_softness;         // tanh 's' parameter (paper §4, typically 0.5)
-    int   num_waves;
+    float cage_softness;         // tanh 's' parameter (Jeschke §4, must be >> 1, e.g. 6.0)
+    int   num_particles;         // active particle count
     float world_size;            // physical world extent in metres
     float height_scale_factor;   // heightmap [0..1] → world-space metres
     float sea_level_normalized;  // sea level as a [0..1] heightmap value
@@ -30,66 +41,24 @@ layout(set = 2, binding = 0) uniform WaveParams {
     float _pad1;
 } params;
 
-// Per-wave data (std430, 32 bytes each).
-struct Wave {
-    vec2  dir;       // normalised XZ propagation direction
-    float amplitude; // wave height (metres)
-    float frequency; // spatial frequency k = 2π/λ
-    float speed;     // angular frequency ω
-    float phase;     // initial phase offset (radians)
-    float steepness; // Gerstner Q ∈ [0, 1] — horizontal choppiness
-    float _pad;
+// Per-particle data (std430, 64 bytes each).
+struct WaveParticle {
+    vec2  pos;         // world position (x, z) [metres]
+    vec2  dir;         // normalised propagation direction (dx, dz)
+    float speed;       // propagation velocity [m/s]
+    float amplitude;   // wave packet height [metres]
+    float radius;      // kernel influence radius [metres]
+    float wavelength;  // spatial wavelength [metres]
+    float age;         // current lifetime [seconds]
+    float lifetime;    // total lifespan [seconds]
+    float steepness;   // Gerstner Q horizontal choppiness [0..1]
+    float is_active;   // 1.0 = active, 0.0 = inactive
+    vec4  _pad;        // padding to 64 bytes
 };
 
-layout(set = 3, binding = 0, std430) buffer WaveData {
-    Wave waves[];
+layout(set = 3, binding = 0, std430) buffer ParticleData {
+    WaveParticle particles[];
 };
-
-// ---------------------------------------------------------------
-// Analytic Gerstner wave summation (GPU Gems 1, Ch. 1).
-//
-// Returns the XYZ displacement in world space.
-// Also writes:
-//   out_n     — analytic surface normal (world space, before cage warping)
-//   out_accel — summed vertical acceleration d²η_y/dt² (m/s²)
-// ---------------------------------------------------------------
-vec3 gerstner_eval(vec2 world_pos, out vec3 out_n, out float out_accel) {
-    vec3  eta    = vec3(0.0);
-    float sum_nx = 0.0;
-    float sum_nz = 0.0;
-    float sum_ny = 0.0;  // accumulated y-normal term
-    float accel  = 0.0;
-
-    for (int i = 0; i < params.num_waves; i++) {
-        Wave  w  = waves[i];
-        float qi = clamp(w.steepness, 0.0, 1.0);
-        float phi = w.frequency * dot(w.dir, world_pos)
-                  - w.speed    * params.time
-                  + w.phase;
-        float sp = sin(phi);
-        float cp = cos(phi);
-
-        // Standard Gerstner displacement:
-        //   η_xz = Q·A·dir·cos(φ)   (horizontal)
-        //   η_y  = A·sin(φ)          (vertical)
-        eta.x += qi * w.amplitude * w.dir.x * cp;
-        eta.z += qi * w.amplitude * w.dir.y * cp;
-        eta.y +=      w.amplitude            * sp;
-
-        // Analytic surface normal terms (GPU Gems 1, §1.3):
-        float kA = w.frequency * w.amplitude;
-        sum_nx  -= w.dir.x * kA * cp;
-        sum_nz  -= w.dir.y * kA * cp;
-        sum_ny  += qi * kA * sp;
-
-        // Second time-derivative of A·sin(φ):  d²/dt² = -A·ω²·sin(φ)
-        accel   += -w.amplitude * w.speed * w.speed * sp;
-    }
-
-    out_n     = normalize(vec3(sum_nx, 1.0 - sum_ny, sum_nz));
-    out_accel = accel;
-    return eta;
-}
 
 // ---------------------------------------------------------------
 // Terrain surface normal at the given UV, derived from finite
@@ -104,13 +73,73 @@ vec3 terrain_normal_at(vec2 uv) {
     float hU = texture(heightmap_tex, uv + vec2(      0.0, -inv_s.y)).r;
     float hD = texture(heightmap_tex, uv + vec2(      0.0,  inv_s.y)).r;
 
-    // World units per heightmap texel.
     float tw = params.world_size / float(sz.x);
     float th = params.world_size / float(sz.y);
 
     float gx = (hR - hL) / (2.0 * tw);
     float gz = (hD - hU) / (2.0 * th);
     return normalize(vec3(-gx, 1.0, -gz));
+}
+
+// ---------------------------------------------------------------
+// Yuksel et al. (2007) Wave Particle Superposition
+// Evaluates the sum of all overlapping active wave packet kernels.
+// ---------------------------------------------------------------
+vec3 evaluate_wave_particles(vec2 world_pos, out vec3 out_n, out float out_accel) {
+    vec3  eta    = vec3(0.0);
+    float sum_nx = 0.0;
+    float sum_nz = 0.0;
+    float sum_ny = 0.0;
+    float accel  = 0.0;
+
+    int count = params.num_particles;
+    for (int i = 0; i < count; i++) {
+        if (particles[i].is_active < 0.5) continue;
+
+        vec2 diff = world_pos - particles[i].pos;
+        float dist = length(diff);
+        float r = particles[i].radius;
+        if (dist > r || r < 0.001) continue;
+
+        float u = dist / r; // [0, 1]
+        // Smooth Hann window envelope (0 at edge, 1 at center, C1 smooth)
+        float pi_u = 3.14159265359 * u;
+        float envelope = 0.5 * (cos(pi_u) + 1.0);
+        float d_env = -0.5 * (3.14159265359 / r) * sin(pi_u);
+
+        // Carrier wave oscillation along propagation direction
+        float k = 6.28318530718 / max(0.1, particles[i].wavelength);
+        float phase = k * dot(diff, particles[i].dir);
+        float cp = cos(phase);
+        float sp = sin(phase);
+
+        float amp = particles[i].amplitude;
+        float qi  = clamp(particles[i].steepness, 0.0, 1.0);
+
+        // Vertical displacement:
+        float dy = amp * envelope * cp;
+        eta.y += dy;
+
+        // Horizontal trochoidal displacement (Gerstner-style sharpening toward crests):
+        vec2 h_disp = -qi * amp * particles[i].dir * envelope * sp;
+        eta.x += h_disp.x;
+        eta.z += h_disp.y;
+
+        // Analytic surface normal gradient:
+        vec2 dist_grad = (dist > 0.0001) ? (diff / dist) : vec2(0.0);
+        vec2 grad_y = d_env * cp * dist_grad - envelope * k * sp * particles[i].dir;
+        sum_nx -= amp * grad_y.x;
+        sum_nz -= amp * grad_y.y;
+        sum_ny += qi * amp * k * envelope * cp;
+
+        // Second time-derivative of vertical displacement:
+        float omega = k * particles[i].speed;
+        accel += -amp * omega * omega * envelope * cp;
+    }
+
+    out_n     = normalize(vec3(sum_nx, 1.0 - sum_ny, sum_nz));
+    out_accel = accel;
+    return eta;
 }
 
 void main() {
@@ -122,14 +151,7 @@ void main() {
     vec2 world_pos = uv * params.world_size;
 
     // ---------------------------------------------------------------
-    // 1. Gerstner summation (raw, uncaged)
-    // ---------------------------------------------------------------
-    vec3  gerstner_n;
-    float accel_y;
-    vec3  eta = gerstner_eval(world_pos, gerstner_n, accel_y);
-
-    // ---------------------------------------------------------------
-    // 2. Read cage parameters
+    // 1. Read cage parameters
     // ---------------------------------------------------------------
     vec4  cage    = texture(static_cage_tex, uv);
     float r1_raw  = cage.r;   // shore-facing radius
@@ -144,25 +166,27 @@ void main() {
         return;
     }
 
-    // Guard against division-by-zero in the ellipsoidal-space transform.
+    // ---------------------------------------------------------------
+    // 2. Wave Particle summation (raw, uncaged)
+    // ---------------------------------------------------------------
+    vec3  wp_normal;
+    float accel_y;
+    vec3  eta = evaluate_wave_particles(world_pos, wp_normal, accel_y);
+
+    // Guard against division-by-zero in ellipsoidal-space transform.
     float r1 = max(r1_raw, 0.001);
     float r2 = max(r2_raw, 0.001);
     float r3 = max(r3_raw, 0.001);
 
     // ---------------------------------------------------------------
     // 3. Build cage frame A = [a1, a2, a3]  (Jeschke §4)
-    //
-    //   a3 = seafloor surface normal (from heightmap gradients)
-    //   a1 = shore direction projected onto a3's tangent plane
-    //   a2 = cross(a3, a1)   (along-shore axis)
     // ---------------------------------------------------------------
     vec3 a3 = terrain_normal_at(uv);
 
-    // Project the packed shore direction onto the tangent plane of a3.
+    // Project packed shore direction onto tangent plane of a3.
     vec3 a1 = vec3(cos(s_angle), 0.0, sin(s_angle));
     a1 = a1 - dot(a1, a3) * a3;
     if (length(a1) < 0.001) {
-        // Degenerate: terrain is nearly vertical along shore direction — try X, then Z.
         a1 = vec3(1.0, 0.0, 0.0) - dot(vec3(1.0, 0.0, 0.0), a3) * a3;
         if (length(a1) < 0.001)
             a1 = vec3(0.0, 0.0, 1.0) - dot(vec3(0.0, 0.0, 1.0), a3) * a3;
@@ -172,16 +196,6 @@ void main() {
 
     // ---------------------------------------------------------------
     // 4. Cage warping — soft-clip η in ellipsoidal space.
-    //
-    //   Correct formula (paper §4, fixing the original code's error):
-    //
-    //     e  = R⁻¹ Aᵀ η          — project η into normalised ellipsoidal coords
-    //     ê  = tanh(s|e|)/|e| · e — tanh soft-clip, preserving direction
-    //     η_c = A R ê             — map back to world space
-    //
-    //   This applies the clipping asymmetrically per axis (each radius ri
-    //   independently limits displacement in that cage direction), which is
-    //   the key correction over the previous code that clipped in world-space.
     // ---------------------------------------------------------------
     float e1   = dot(a1, eta) / r1;
     float e2   = dot(a2, eta) / r2;
@@ -189,9 +203,15 @@ void main() {
     float elen = length(vec3(e1, e2, e3));
 
     vec3 en = vec3(0.0);
+    float cage_ratio = 1.0;
     if (elen > 0.0001) {
-        float clip = tanh(params.cage_softness * elen) / elen;
+        // Jeschke 2020 ellipsoidal cage soft-clipping:
+        // Bound displacement magnitude strictly within the unit ellipsoid (||en|| < 1.0),
+        // while preserving unconstrained Gerstner waves when elen << 1 in open water (clip -> 1.0).
+        float p = max(2.0, params.cage_softness);
+        float clip = 1.0 / pow(1.0 + pow(elen, p), 1.0 / p);
         en = vec3(e1, e2, e3) * clip;
+        cage_ratio = clamp(clip, 0.0, 1.0);  // Attenuation ratio for normal warping
     }
 
     // A R ê — reconstruct world-space cage-warped displacement.
@@ -199,18 +219,21 @@ void main() {
                + a2 * (en.y * r2)
                + a3 * (en.z * r3);
 
+    // Cage-warp the normal: lerp toward flat (0,1,0) by the same attenuation
+    // ratio so specular highlights match the attenuated displacement near shore.
+    vec3 caged_normal = normalize(mix(vec3(0.0, 1.0, 0.0), wp_normal, cage_ratio));
+
     // ---------------------------------------------------------------
     // 5. Breaking-wave trigger.
     //    A crest breaks when vertical acceleration exceeds gravity (|a_y| > g).
-    //    Normalise to [0, 1] so the spatial shader can threshold at 0.5.
     // ---------------------------------------------------------------
     float breaking = clamp(abs(accel_y) / 9.8, 0.0, 1.0);
 
     // ---------------------------------------------------------------
     // 6. Write outputs
     //    displacement: XYZ = cage-warped displacement, A = breaking trigger
-    //    normal:       XYZ = analytic Gerstner surface normal (world space)
+    //    normal:       XYZ = analytic cage-warped surface normal (world space)
     // ---------------------------------------------------------------
     imageStore(out_displacement, pos, vec4(eta_c, breaking));
-    imageStore(out_normal,       pos, vec4(gerstner_n, 1.0));
+    imageStore(out_normal,       pos, vec4(caged_normal, 1.0));
 }

@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://render_terrain_qc_uid"]
+
+[ext_resource type="Script" path="res://tools/render_terrain_qc.gd" id="1_qc"]
+
+[node name="RenderTerrainQC" type="Node"]
+script = ExtResource("1_qc")

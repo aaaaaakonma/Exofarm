@@ -11,14 +11,19 @@
 static constexpr int64_t ONE          = 65536;
 static constexpr int64_t PI_FIXED     = 205887;   // PI * 65536
 static constexpr int64_t HALF_PI      = 102944;
-static constexpr int64_t TWO_PI       = 411775;
+static constexpr int64_t TWO_PI       = 411774;
 static constexpr int64_t K_FACTOR     = 39797;    // CORDIC gain correction * 65536
 
 inline int64_t mul_fixed(int64_t a, int64_t b) { return (a * b) >> 16; }
-inline int64_t div_fixed(int64_t a, int64_t b) { return (a << 16) / b; }
+inline int64_t div_fixed(int64_t a, int64_t b) { if (b == 0) return 0; return (static_cast<int64_t>(static_cast<uint64_t>(a) << 16)) / b; }
 inline int64_t abs_fixed(int64_t a)            { return a < 0 ? -a : a; }
 inline int64_t min_fixed(int64_t a, int64_t b) { return a < b ? a : b; }
 inline int64_t max_fixed(int64_t a, int64_t b) { return a > b ? a : b; }
+
+inline float   fixed_to_float(int64_t x)       { return (float)x / 65536.0f; }
+inline double  fixed_to_double(int64_t x)      { return (double)x / 65536.0; }
+inline int64_t float_to_fixed(float x)         { return (int64_t)(x * 65536.0f); }
+inline int64_t double_to_fixed(double x)       { return (int64_t)(x * 65536.0); }
 
 // Pure-integer square root for 16.16 fixed point.
 // Uses binary search: finds r such that r*r == x in 16.16 space.
@@ -61,24 +66,13 @@ inline int64_t sqrt_fixed(int64_t x) {
 // Pure-integer inverse square root for 16.16 fixed point.
 // Returns 1/sqrt(x) in 16.16 format.
 // Uses sqrt_fixed then divides: inv_sqrt(x) = 1 / sqrt(x) = ONE / sqrt(x).
-// Two Newton-Raphson iterations refine the result.
+// Note: div_fixed(ONE, s) provides exact 1-LSB precision since sqrt_fixed has already converged.
 inline int64_t inv_sqrt_fixed(int64_t x) {
     if (x <= 64) return 65536 * 100; // Cap for very small values
 
     int64_t s = sqrt_fixed(x);
     if (s <= 0) return 65536 * 100;
-    int64_t res = div_fixed(ONE, s);
-
-    // Two Newton-Raphson iterations for inv_sqrt:
-    // x_{n+1} = x_n * (3 - val * x_n^2) / 2
-    for (int i = 0; i < 2; ++i) {
-        int64_t x0_sq = (res * res) >> 16;
-        int64_t x_x0_sq = (x * x0_sq) >> 16;
-        int64_t three_minus = (3LL << 16) - x_x0_sq;
-        res = (res * three_minus) >> 17;
-    }
-
-    return res;
+    return div_fixed(ONE, s);
 }
 
 // Normalize an angle (16.16 radians) into [-PI, PI] in O(1) using integer modular arithmetic.

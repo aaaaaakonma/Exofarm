@@ -1,16 +1,25 @@
 #pragma once
 #include "entity.h"
+#include "item.h"
 #include "input.h"
 #include "ecs.h"
 #include "rng.h"
 #include "tile_registry.h"
 #include "hydrology_graph.h"
 #include "tectonic_heightmap.h"
+#include "opentopo_heightmap.h"
+#include "river_network.h"
+#include "dem_erosion.h"
 #include <vector>
 #include <unordered_set>
 #include <cstdint>
 #include <memory>
 #include <cstring>
+
+enum class WorldGenMode : uint8_t {
+    PROCEDURAL_TECTONIC = 0,
+    SYNTHESIZED_OPENTOPO = 1
+};
 
 enum class WeatherState : uint8_t {
     CLEAR = 0,
@@ -115,6 +124,8 @@ public:
 
     bool has_entity(EntityID id) const;
     uint32_t get_dense_idx(EntityID id) const;
+    void sync_node_aabb(uint32_t idx) { _sync_node_aabb(idx); }
+    void _sync_node_aabb(uint32_t idx);
 
     const EntityStats& get_stats(EntityID id) const;
     EntityStats& get_stats_mut(EntityID id);
@@ -148,6 +159,11 @@ public:
         _aquifers.assign(total_cells, 0);
         _rivers.assign(total_cells, 0);
         _flow_targets.assign(total_cells, -1);
+        _water_depth.assign(total_cells, 0);
+        _water_flux.assign(total_cells, 0);
+        _water_flow_x.assign(total_cells, 0);
+        _water_flow_y.assign(total_cells, 0);
+        _water_sediment.assign(total_cells, 0);
         _lakes.assign(total_cells, 0);
         _structure_type.assign(total_cells, 0);
         _water_pressure.assign(total_cells, 0);
@@ -156,7 +172,16 @@ public:
         _biome.assign(total_cells, 0);
         _surface_type.assign(total_cells, 0);
         _mineral_type.assign(total_cells, 0);
+        int32_t chunk_w = (width + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        int32_t chunk_h = (height + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        if (chunk_w > 0 && chunk_h > 0) {
+            _chunk_tiers.assign((size_t)chunk_w * chunk_h, TIER_FROZEN);
+        } else {
+            _chunk_tiers.clear();
+        }
         _planted_tile_indices.clear();
+        _terrain_trees.clear();
+        _chunk_trees.clear();
     }
     void set_water_table(const std::vector<int32_t>& wt) { _water_table = wt; }
     void set_aquifers(const std::vector<uint8_t>& aq) { _aquifers = aq; }
@@ -200,6 +225,13 @@ public:
     const std::vector<int32_t>& get_water_table() const { return _water_table; }
     const std::vector<uint8_t>& get_aquifers() const { return _aquifers; }
     const std::vector<uint8_t>& get_rivers() const { return _rivers; }
+    const std::vector<int32_t>& get_water_depth() const { return _water_depth; }
+    std::vector<int32_t>& get_water_depth_mut() { return _water_depth; }
+    void set_water_depth(const std::vector<int32_t>& wd) { _water_depth = wd; }
+    const std::vector<int64_t>& get_water_flux() const { return _water_flux; }
+    const std::vector<int32_t>& get_water_flow_x() const { return _water_flow_x; }
+    const std::vector<int32_t>& get_water_flow_y() const { return _water_flow_y; }
+    const std::vector<int32_t>& get_water_sediment() const { return _water_sediment; }
     const std::vector<int32_t>& get_flow_targets() const { return _flow_targets; }
     const std::vector<uint8_t>& get_lakes() const { return _lakes; }
     const std::vector<uint8_t>& get_structure_type() const { return _structure_type; }
@@ -238,9 +270,59 @@ public:
     Tectonics::ContinuousTectonicHeightmap::Config& get_tectonic_config_mut() { return _tectonic_config; }
     void set_tectonic_config(const Tectonics::ContinuousTectonicHeightmap::Config& cfg) { _tectonic_config = cfg; }
 
+    void set_world_gen_mode(WorldGenMode mode) { _world_gen_mode = mode; }
+    WorldGenMode get_world_gen_mode() const { return _world_gen_mode; }
+    bool load_opentopo_dataset(const std::string& path) {
+        _opentopo_dataset_path = path;
+        return _opentopo_heightmap.load_binary(path);
+    }
+    void set_opentopo_sea_level_offset(int64_t offset) { _opentopo_sea_level_offset = offset; }
+    int64_t get_opentopo_sea_level_offset() const { return _opentopo_sea_level_offset; }
+    void set_opentopo_sea_buffer_tiles(int32_t tiles) { _opentopo_sea_buffer_tiles = tiles; }
+    int32_t get_opentopo_sea_buffer_tiles() const { return _opentopo_sea_buffer_tiles; }
+    void set_opentopo_apply_erosion(bool enable) { _opentopo_apply_erosion = enable; }
+    bool get_opentopo_apply_erosion() const { return _opentopo_apply_erosion; }
+    void set_apply_erosion(bool enable) { _opentopo_apply_erosion = enable; }
+    bool get_apply_erosion() const { return _opentopo_apply_erosion; }
+    void set_apply_coastal_erosion(bool enable) { _apply_coastal_erosion = enable; }
+    bool get_apply_coastal_erosion() const { return _apply_coastal_erosion; }
+    void set_coastal_erosion_iterations(int32_t iters) { _coastal_erosion_iterations = iters; }
+    int32_t get_coastal_erosion_iterations() const { return _coastal_erosion_iterations; }
+    void set_coastal_erosion_strength(int64_t strength) { _coastal_erosion_strength = strength; }
+    int64_t get_coastal_erosion_strength() const { return _coastal_erosion_strength; }
+
+    void set_apply_droplet_erosion(bool enable) { _apply_droplet_erosion = enable; }
+    bool get_apply_droplet_erosion() const { return _apply_droplet_erosion; }
+    void set_droplet_config(const Erosion::DropletErosionConfig& cfg) { _droplet_config = cfg; }
+    const Erosion::DropletErosionConfig& get_droplet_config() const { return _droplet_config; }
+    Erosion::DropletErosionConfig& get_droplet_config_mut() { return _droplet_config; }
+
+    void set_river_min_area(int32_t a) { _river_min_area = a; }
+    int32_t get_river_min_area() const { return _river_min_area; }
+    void set_river_carve_depth(int64_t d) { _river_carve_depth = d; }
+    int64_t get_river_carve_depth() const { return _river_carve_depth; }
+    void set_river_width_multiplier(int64_t m) { _river_width_multiplier = m; }
+    int64_t get_river_width_multiplier() const { return _river_width_multiplier; }
+
+    const Hydrology::ParameterizedRiverNetwork& get_parametric_rivers() const { return _parametric_rivers; }
+    Hydrology::ParameterizedRiverNetwork& get_parametric_rivers_mut() { return _parametric_rivers; }
+    const Topo::OpenTopoHeightmap& get_opentopo_heightmap() const { return _opentopo_heightmap; }
+    Topo::OpenTopoHeightmap& get_opentopo_heightmap_mut() { return _opentopo_heightmap; }
+
+    // --- Chunked Trees & Procedural Vegetation ---
+    void generate_vegetation(uint64_t seed, int32_t w, int32_t h, int64_t cell_size_fixed);
+    void fast_forward_chunk_trees(int32_t cx, int32_t cy, uint32_t target_tick);
+    const std::vector<TerrainTree>& get_terrain_trees() const { return _terrain_trees; }
+    void set_terrain_trees(const std::vector<TerrainTree>& trees);
+    void add_terrain_tree(const TerrainTree& tree);
+    const std::vector<uint32_t>& get_trees_in_chunk(int32_t cx, int32_t cy) const;
+    size_t get_tree_count() const { return _terrain_trees.size(); }
+    int32_t get_chunk_grid_w() const { return (_map_width + CHUNK_SIZE - 1) / CHUNK_SIZE; }
+    int32_t get_chunk_grid_h() const { return (_map_height + CHUNK_SIZE - 1) / CHUNK_SIZE; }
+
 
     static std::vector<uint8_t> serialize_snapshot(const BisectSnapshot &snap);
-    static const uint8_t*       deserialize_snapshot(BisectSnapshot &snap, const uint8_t *ptr);
+    static const uint8_t*       deserialize_snapshot(BisectSnapshot &snap, const uint8_t *ptr, size_t total_size = 0);
 
     static constexpr int64_t ACTIVATION_RADIUS = 500 * 65536; // 500 units (Aggro 400 + Buffer 100)
 
@@ -263,13 +345,33 @@ public:
     void tick_environment();
     void tick_crops();
 
-    void plant_crop(int32_t x, int32_t y, uint8_t crop_type, uint8_t prefix = 0, uint8_t suffix = 0, uint8_t implicit = 0);
-    void harvest_crop(int32_t x, int32_t y);
+    // --- Wood Chopping & Tree Interactions ---
+    bool chop_tree(int64_t world_x, int64_t world_z, int32_t damage = 25, int64_t max_reach = 0);
+    int32_t get_tree_health(uint32_t tree_id) const;
+    bool is_tree_alive(uint32_t tree_id) const;
+    const TerrainTree* get_tree_by_id(uint32_t tree_id) const;
+    const TerrainTree* get_nearest_tree(int64_t world_x, int64_t world_z, int64_t max_reach = 0) const;
+
+    // --- Farming Pipeline ---
+    bool till_soil(int32_t x, int32_t y);
+    bool water_soil(int32_t x, int32_t y, int64_t amount = 30 * ONE);
+    bool plant_crop(int32_t x, int32_t y, uint8_t crop_type, uint8_t prefix = 0, uint8_t suffix = 0, uint8_t implicit = 0);
+    bool harvest_crop(int32_t x, int32_t y);
+    bool is_crop_mature(int32_t x, int32_t y) const;
+    int32_t get_soil_moisture(int32_t x, int32_t y) const;
+    int32_t get_soil_compactness(int32_t x, int32_t y) const;
+
+    // --- Drops & Item Queries ---
+    EntityID get_last_dropped_item() const { return _last_dropped_item; }
+    const ItemData& get_last_generated_item() const { return _last_generated_item; }
     void apply_fertilizer(int32_t x, int32_t y, int64_t n, int64_t p, int64_t k, int64_t ca, int64_t mg, int64_t s);
     void damage_crop(int32_t idx, int32_t amount);
     
     void place_structure(int32_t x, int32_t y, uint8_t structure_type);
     void remove_structure(int32_t x, int32_t y);
+
+    bool can_modify_terrain(int32_t x, int32_t y) const;
+    bool modify_terrain(int32_t x, int32_t y, int32_t delta_elev);
 
     EntityID spawn_bot(uint8_t bot_type, int64_t x, int64_t y);
     void set_bot_job(EntityID bot_id, uint8_t job, int32_t tx, int32_t ty, uint8_t seed_type);
@@ -286,12 +388,12 @@ public:
     void _do_equip(EntityID entity_id, int slot, uint64_t item_id);
     void _do_place_structure(int32_t x, int32_t y, uint8_t structure_type);
     void _do_remove_structure(int32_t x, int32_t y);
+    void _do_modify_terrain(int32_t x, int32_t y, int32_t delta_elev);
     void _do_spawn_bot(EntityID bot_id, uint8_t bot_type, int64_t x, int64_t y);
     void _do_set_bot_job(EntityID bot_id, uint8_t job, int32_t tx, int32_t ty, uint8_t seed_type);
     void _do_upload_bot_program(EntityID bot_id, const uint16_t* opcodes, uint16_t size);
     void _do_wire_bot_ports(EntityID bot_id, int32_t sx, int32_t sy, int32_t ax, int32_t ay);
     void tick_bots();
-    void _sync_node_aabb(uint32_t idx);
 
     // ---- SYSTEMS ----
     EntityContainer _entities;
@@ -364,4 +466,34 @@ public:
     Hydrology::HydraulicGraph _hydraulic_graph;
     Tectonics::ContinuousTectonicHeightmap _tectonic_heightmap;
     Tectonics::ContinuousTectonicHeightmap::Config _tectonic_config;
+
+    WorldGenMode _world_gen_mode = WorldGenMode::PROCEDURAL_TECTONIC;
+    Topo::OpenTopoHeightmap _opentopo_heightmap;
+    Hydrology::ParameterizedRiverNetwork _parametric_rivers;
+    std::string _opentopo_dataset_path = "assets/data/topo/alpine_basin.bin";
+    int64_t _opentopo_sea_level_offset = 0;
+    int32_t _opentopo_sea_buffer_tiles = 32;
+    bool _opentopo_apply_erosion = true;
+    bool _apply_coastal_erosion = true;
+    int32_t _coastal_erosion_iterations = 3;
+    int64_t _coastal_erosion_strength = 98304; // 1.5 * ONE
+
+    bool _apply_droplet_erosion = true;
+    Erosion::DropletErosionConfig _droplet_config;
+    int32_t _river_min_area = 40;
+    int64_t _river_carve_depth = (9 * ONE) / 2; // 4.5m
+    int64_t _river_width_multiplier = ONE; // 1.0
+
+    std::vector<int32_t> _water_depth;
+    std::vector<int32_t> _water_sediment;
+    std::vector<int32_t> _water_flow_x;
+    std::vector<int32_t> _water_flow_y;
+    std::vector<int64_t> _water_flux;
+
+    std::vector<TerrainTree> _terrain_trees;
+    std::vector<std::vector<uint32_t>> _chunk_trees;
+    static const std::vector<uint32_t> _empty_chunk_trees;
+
+    EntityID _last_dropped_item = 0;
+    ItemData _last_generated_item{};
 };

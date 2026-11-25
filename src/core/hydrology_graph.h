@@ -1,5 +1,6 @@
 #pragma once
 #include "fixed.h"
+#include "river_network.h"
 #include <vector>
 #include <cstdint>
 #include <unordered_map>
@@ -78,6 +79,29 @@ public:
         _pump_extractions.clear();
     }
 
+    void build_from_parametric_network(const ParameterizedRiverNetwork& net, int32_t w, int32_t h, int64_t cell_size_fixed) {
+        clear();
+        if (cell_size_fixed <= 0 || net.reaches.empty()) return;
+
+        for (const auto& r : net.reaches) {
+            std::vector<int32_t> tiles;
+            int32_t last_tile = -1;
+            for (const auto& pt : r.waypoints) {
+                int32_t gx = static_cast<int32_t>(pt.x / cell_size_fixed);
+                int32_t gy = static_cast<int32_t>(pt.y / cell_size_fixed);
+                if (gx >= 0 && gx < w && gy >= 0 && gy < h) {
+                    int32_t tidx = gy * w + gx;
+                    if (tidx != last_tile) {
+                        tiles.push_back(tidx);
+                        last_tile = tidx;
+                    }
+                }
+            }
+            int64_t max_q = r.max_capacity > 0 ? r.max_capacity : (static_cast<int64_t>(tiles.size()) * FLOW_CAPACITY_PER_TILE);
+            add_river_belt(0, 0, max_q, tiles, r.upstream_reach_id, r.downstream_reach_id, r.tier, r.upstream_reach_ids);
+        }
+    }
+
     uint32_t add_reservoir(int64_t initial_vol, int64_t max_cap, bool infinite, const std::vector<int32_t>& tiles) {
         uint32_t id = static_cast<uint32_t>(_reservoirs.size() + 1);
         ReservoirNode node;
@@ -144,8 +168,45 @@ public:
     void tick_hydrology(int32_t dt, uint8_t weather_state, int64_t rain_rate) {
         if (dt <= 0) return;
 
-        // 1. Process River Pipes: transfer water from upstream reservoir/tributary reaches to downstream reaches
-        for (auto& belt : _river_belts) {
+        // 1. Process River Pipes in topological upstream-to-downstream order
+        size_t num_belts = _river_belts.size();
+        std::vector<int32_t> in_deg(num_belts, 0);
+        std::vector<std::vector<size_t>> adj(num_belts);
+        for (size_t i = 0; i < num_belts; ++i) {
+            const auto& belt = _river_belts[i];
+            if (!belt.upstream_belt_ids.empty()) {
+                for (uint32_t up_id : belt.upstream_belt_ids) {
+                    if (up_id > 0 && up_id <= num_belts && up_id - 1 != i) {
+                        adj[up_id - 1].push_back(i);
+                        in_deg[i]++;
+                    }
+                }
+            } else if (belt.upstream_belt_id > 0 && belt.upstream_belt_id <= num_belts && belt.upstream_belt_id - 1 != i) {
+                adj[belt.upstream_belt_id - 1].push_back(i);
+                in_deg[i]++;
+            }
+        }
+
+        std::vector<size_t> order;
+        order.reserve(num_belts);
+        for (size_t i = 0; i < num_belts; ++i) {
+            if (in_deg[i] == 0) order.push_back(i);
+        }
+        size_t head = 0;
+        while (head < order.size()) {
+            size_t u = order[head++];
+            for (size_t v : adj[u]) {
+                if (--in_deg[v] == 0) order.push_back(v);
+            }
+        }
+        if (order.size() < num_belts) {
+            for (size_t i = 0; i < num_belts; ++i) {
+                if (in_deg[i] > 0) order.push_back(i);
+            }
+        }
+
+        for (size_t b_idx : order) {
+            auto& belt = _river_belts[b_idx];
             int64_t upstream_inflow = 0;
             if (!belt.upstream_belt_ids.empty()) {
                 for (uint32_t up_id : belt.upstream_belt_ids) {

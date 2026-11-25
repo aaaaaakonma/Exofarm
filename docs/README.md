@@ -17,6 +17,7 @@ The documentation is organized into modular deep-dive guides:
 | 💧 **[Hydrology, Agronomy & Ecology](file:///E:/exofarm/exofarm/docs/HYDROLOGY_AND_AGRONOMY.md)** | Closed-loop hydraulic graph (reservoirs & river reaches), pump parasitism & drought cascades, 6-nutrient soil chemistry (NPK + CaMgS), crop genetics & affixes, irrigation plumbing, carbon cycle & weather hazards, chunk LOD. |
 | 🤖 **[ECS, Robotics & IoT Virtual Machine](file:///E:/exofarm/exofarm/docs/AUTOMATION_AND_ECS.md)** | Data-oriented Structure-of-Arrays (SoA) ECS (`ChaosState`), mobile robots (humanoid, drone, combine), stationary IoT microcontroller VM with custom 16-bit ISA, monotonic replay tapes, 64-bit state hashing. |
 | 🖥️ **[GDExtension & GPU Wave Cages](file:///E:/exofarm/exofarm/docs/GDEXTENSION_AND_RENDERING.md)** | `SimBridge` translation layer, zero-copy buffer marshaling, Jeschke et al. 2020 boundary-aware wave cages via GPU Jump Flooding Algorithm, spatial water shaders, 2D and 3D frontend visualizers. |
+| 🌲 **[Dynamic Botanical Tree Generator](file:///E:/exofarm/exofarm/docs/DYNAMIC_TREE_GENERATOR.md)** | Procedural dynamic tree generation, continuous growth scrubbing ($g \in [0, 1]$), species presets (conifer, oak, birch, snag), RMF twist-free tube extrusion, Leonardo pipe model, collision & foliage sockets. |
 | 🧪 **[Headless Verification & Testing](file:///E:/exofarm/exofarm/docs/VERIFICATION_AND_TESTING.md)** | Standalone headless test suite (`test_determinism`, `test_hydrology`, `test_tectonics`, `test_biomes`), 500-tick lockstep replay verification, topological cycle detection, SCons build system. |
 
 ---
@@ -28,14 +29,14 @@ The engine is architected around strict separation of concerns:
 ```mermaid
 flowchart TD
     subgraph Frontend["Godot Engine 4.x Frontend (Visuals & Audio)"]
-        UI["UI & Input Gathering"]
-        VIS3D["3D World Visualizer (world_3d_visualizer.gd)"]
-        VIS2D["2D Continental Visualizers (map_gen_visualizer.gd)"]
+        UI["Main Scene & Input Gathering (main.gd)"]
+        VIS3D["3D World Visualizer (scenes/visualizers/world_3d_visualizer.gd)"]
+        VIS2D["2D Continental Visualizers (scenes/visualizers/map_gen_visualizer.gd)"]
         WAVE["GPU Wave Compute Driver (assets/shaders/)"]
     end
 
     subgraph Boundary["GDExtension Boundary (Zero-Logic Translation)"]
-        BRIDGE["SimBridge (sim_bridge.cpp / sim_bridge.h)"]
+        BRIDGE["SimBridge & BotanicalTreeBridge (src/gdextension/)"]
         REG["register_types.cpp (GDExtension Entry Point)"]
     end
 
@@ -76,6 +77,10 @@ E:/exofarm/exofarm/
 │   │   ├── ecs.h                          # EntityContainer SoA memory manager & ID maps
 │   │   ├── entity.h                       # Entity structures, ChaosState, CropAffixes, BotState
 │   │   ├── input.h                        # InputFrame discriminated union & action bitmasks
+│   │   ├── botanical_tree.h / .cpp        # Deterministic 16.16 botanical tree generator
+│   │   ├── dem_erosion.h                  # Priority-flood, D8 drainage, droplet & coastal erosion
+│   │   ├── river_network.h                # Parameterized spline river network & estuary plumes
+│   │   ├── opentopo_heightmap.h           # Binary DEM ingestion & bicubic terrain synthesis
 │   │   ├── hydrology_graph.h              # ReservoirNode, RiverBelt, HydraulicGraph network
 │   │   ├── tectonic_heightmap.h           # ContinuousTectonicHeightmap & geodynamic physics
 │   │   ├── tile_registry.h                # Binary room blueprint and tile anchor loader
@@ -93,24 +98,51 @@ E:/exofarm/exofarm/
 │   │   └── player.h / player.cpp          # Deterministic Player movement, terrain drag, controls
 │   │
 │   ├── gdextension/                       # Godot C++ GDExtension binding layer
-│   │   ├── register_types.h / .cpp        # GDExtension module registration
+│   │   ├── register_types.h / .cpp        # GDExtension module registration (exofarm_library_init)
+│   │   ├── botanical_tree_bridge.h / .cpp # BotanicalTreeBridge node exposing C++ trees to Godot
 │   │   └── sim_bridge.h / sim_bridge.cpp  # SimBridge node exposing SimWorld to Godot
 │   │
-│   └── tests/                             # Unit tests
+│   └── tests/                             # Core math unit tests
 │       └── test_fixed_3d.cpp              # Trigonometry and quaternion precision check
 │
 ├── assets/shaders/                        # GPU Compute & Rendering Assets
 │   ├── wave_cage_baker.gd / .glsl         # GPU Jump Flooding Algorithm (JFA) distance baker
 │   ├── wave_compute_driver.gd / .glsl     # Real-time boundary-aware Gerstner compute driver
-│   └── wave_water.gdshader                # Spatial water surface shader with foam blending
+│   ├── wave_water.gdshader                # Spatial water surface shader with foam blending
+│   ├── river_water.gdshader               # Continuous river surface flow shader
+│   ├── tree_canopy_compute.glsl / _driver.gd # GPU canopy cluster light attenuation compute
+│   ├── tree_foliage.gdshader              # Botanical foliage card shader with translucency
+│   └── world_terrain_3d.gdshader          # Slope/biome/river-aware 3D terrain shader
 │
-├── test_determinism.cpp                   # Standalone 500-tick lockstep replay verification tool
-├── test_hydrology.cpp                     # Standalone hydraulic graph & river topology analyzer
-├── test_tectonics.cpp                     # Standalone continuous tectonic geodynamics tester
-├── test_biomes.cpp                        # Headless Whittaker biome distribution analyzer
-├── world_3d_visualizer.gd / .tscn         # Interactive 3D terrain and real-time wave visualizer
-├── map_gen_visualizer.gd / .tscn          # 2D multi-layer continental map generator visualizer
-├── river_micro_visualizer.gd / .tscn      # Ground-level micro river and flow direction visualizer
+├── scripts/                               # Shared GDScript Helpers & Components
+│   ├── botanical_tree_materials.gd        # Foliage card atlases, shaders & collision helpers
+│   ├── dynamic_tree.gd                    # DynamicTree Node3D wrapper over BotanicalTreeBridge
+│   └── pack_terrain_materials.py          # Terrain PBR texture array packer
+│
+├── scenes/visualizers/                    # Interactive Diagnostic Visualizers
+│   ├── world_3d_visualizer.gd / .tscn     # Interactive 3D terrain, rivers, trees & GPU waves
+│   ├── map_gen_visualizer.gd / .tscn      # 2D multi-layer continental map generator visualizer
+│   ├── map_visualizer.gd / .tscn          # 2D Factorio-scale simulation visualizer
+│   ├── river_micro_visualizer.gd / .tscn  # Ground-level micro river currents & drought tool
+│   └── tree_growth_visualizer.gd / .tscn  # Interactive 3D botanical tree & grove workbench
+│
+├── tests/                                 # Headless Verification Suites
+│   ├── cpp/                               # Standalone C++ headless tests (SIM_HEADLESS)
+│   │   ├── test_determinism.cpp           # 500-tick lockstep replay verification tool
+│   │   ├── test_hydrology.cpp             # Hydraulic graph & river topology analyzer
+│   │   ├── test_tectonics.cpp             # Continuous tectonic geodynamics tester
+│   │   ├── test_biomes.cpp                # Whittaker biome distribution analyzer
+│   │   ├── test_erosion.cpp               # Erosion, talus, and coastal breaker tests
+│   │   ├── test_opentopo.cpp              # OpenTopo binary DEM & spline tests
+│   │   ├── test_estuary_waves.cpp         # Estuary mouth & ocean plume wave boundary tests
+│   │   ├── test_terrain_manipulation.cpp  # Runtime terrain modification & rollback tests
+│   │   └── test_droplet_river.cpp         # Droplet erosion & drainage river extraction suite
+│   └── gd/                                # Headless Godot verification scripts
+│       └── test_botanical_bridge.gd       # BotanicalTreeBridge & canopy compute verification
+│
+├── tools/                                 # Offline Tools & QC Utilities
+├── main.gd / main.tscn                    # Primary 3D traversal & gameplay scene
+├── exofarm.gdextension                    # Godot GDExtension manifest
 └── SConstruct                             # SCons build script for MSVC, Clang, GCC & headless tools
 ```
 
@@ -181,7 +213,8 @@ scons platform=windows tectonics
 ```
 
 ### 5.3 Launching Visualizers in Godot
-Open the project directory in the Godot 4.x editor and launch any of the test scenes:
-- `world_3d_visualizer.tscn`: 3D interactive terrain, plate vectors, and GPU wave cages.
-- `map_gen_visualizer.tscn`: 2D full-world continental map generator and layer inspector.
-- `river_micro_visualizer.tscn`: Ground-level micro river currents and drought diagnostic tool.
+Open the project directory in the Godot 4.x editor and launch `main.tscn` or any visualizer in `scenes/visualizers/`:
+- `scenes/visualizers/world_3d_visualizer.tscn`: 3D interactive terrain, plate vectors, and GPU wave cages.
+- `scenes/visualizers/map_gen_visualizer.tscn`: 2D full-world continental map generator and layer inspector.
+- `scenes/visualizers/river_micro_visualizer.tscn`: Ground-level micro river currents and drought diagnostic tool.
+- `scenes/visualizers/tree_growth_visualizer.tscn`: Interactive 3D botanical tree and grove workbench.

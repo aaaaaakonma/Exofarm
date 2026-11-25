@@ -41,8 +41,6 @@ inline int64_t hermite_smooth(int64_t t) {
 inline int64_t gradient_noise2d(int64_t x_fixed, int64_t y_fixed, uint64_t seed) {
     int32_t x0 = static_cast<int32_t>(x_fixed >> 16);
     int32_t y0 = static_cast<int32_t>(y_fixed >> 16);
-    if (x_fixed < 0 && (x_fixed & 0xFFFF) != 0) x0--;
-    if (y_fixed < 0 && (y_fixed & 0xFFFF) != 0) y0--;
 
     int32_t x1 = x0 + 1;
     int32_t y1 = y0 + 1;
@@ -155,8 +153,6 @@ struct VoronoiResult {
 inline VoronoiResult voronoi2d(int64_t x_fixed, int64_t y_fixed, uint64_t seed) {
     int32_t x0 = static_cast<int32_t>(x_fixed >> 16);
     int32_t y0 = static_cast<int32_t>(y_fixed >> 16);
-    if (x_fixed < 0 && (x_fixed & 0xFFFF) != 0) x0--;
-    if (y_fixed < 0 && (y_fixed & 0xFFFF) != 0) y0--;
 
     int64_t min_dist_sq = 0x7FFFFFFFFFFFFFFF;
     int32_t best_cx = x0;

@@ -7,53 +7,16 @@
 #include <vector>
 #include <cstdint>
 #include <cmath>
-#include <cstdlib>   // std::abs (integer overloads)
+// <cstdlib> removed: std::abs (integer overloads) is unused; abs_fixed() is used throughout.
 #include <algorithm>
+#include <unordered_map>
 #include <climits>   // INT32_MIN / INT32_MAX for clamp guards
 #include <cassert>
 
 namespace Tectonics {
 
-// ===== 2D Fixed-Point Vector =====
-struct Vec2Fixed {
-    int64_t x = 0;
-    int64_t y = 0;
-
-    constexpr Vec2Fixed() = default;
-    constexpr Vec2Fixed(int64_t _x, int64_t _y) : x(_x), y(_y) {}
-
-    FORCE_INLINE Vec2Fixed operator+(const Vec2Fixed& o) const { return {x + o.x, y + o.y}; }
-    FORCE_INLINE Vec2Fixed operator-(const Vec2Fixed& o) const { return {x - o.x, y - o.y}; }
-    FORCE_INLINE Vec2Fixed operator*(int64_t scalar) const { return {mul_fixed(x, scalar), mul_fixed(y, scalar)}; }
-    FORCE_INLINE Vec2Fixed operator/(int64_t scalar) const { return {div_fixed(x, scalar), div_fixed(y, scalar)}; }
-
-    FORCE_INLINE int64_t dot(const Vec2Fixed& o) const {
-        return mul_fixed(x, o.x) + mul_fixed(y, o.y);
-    }
-
-    FORCE_INLINE int64_t cross(const Vec2Fixed& o) const {
-        return mul_fixed(x, o.y) - mul_fixed(y, o.x);
-    }
-
-    FORCE_INLINE int64_t length_sq() const {
-        return dot(*this);
-    }
-
-    FORCE_INLINE int64_t length() const {
-        return sqrt_fixed(length_sq());
-    }
-
-    FORCE_INLINE Vec2Fixed normalized() const {
-        int64_t len_sq = length_sq();
-        if (len_sq <= 16) return {0, 0};
-        int64_t inv_len = inv_sqrt_fixed(len_sq);
-        return (*this) * inv_len;
-    }
-
-    FORCE_INLINE Vec2Fixed perpendicular() const {
-        return {-y, x};
-    }
-};
+// Use canonical 2D Fixed-Point Vector from fixed_3d.h
+using Vec2Fixed = ::Vec2Fixed;
 
 // ===== Plate Classification & Tectonic Boundaries =====
 
@@ -129,6 +92,10 @@ struct MacroPlateEdge {
     int64_t impact_force = 0;     // Collisional impact force (16.16)
     int64_t alpha = 24 * ONE;     // Characteristic elastic flexural parameter (16.16)
     int64_t peak_uplift = 0;      // Base peak uplift / orogenic relief (16.16)
+    int64_t uplift_v0 = 0;        // Harmonized target uplift at vertex v0 (16.16)
+    int64_t uplift_v1 = 0;        // Harmonized target uplift at vertex v1 (16.16)
+    int64_t base_v0 = 0;          // Harmonized baseline elevation at vertex v0 (16.16)
+    int64_t base_v1 = 0;          // Harmonized baseline elevation at vertex v1 (16.16)
     bool a_overrides = false;     // True if plate A is the overriding crustal slab
 };
 
@@ -155,8 +122,6 @@ struct TectonicNode {
     uint32_t plate_id = 0;           // Macro tectonic plate ID (defaults to id if 0)
     Vec2Fixed position;              // World coordinate position (16.16)
     Vec2Fixed velocity;              // Drift velocity vector (16.16)
-    int64_t angular_velocity = 0;    // Rotational velocity (radians/step in 16.16)
-    Vec2Fixed tilt_vector = {0, 0};  // 3D planar tilt gradient (slope dZ/dX, dZ/dY in 16.16)
     PlateType plate_type = PlateType::CONTINENTAL;
 
     int64_t base_elevation  = 30 * ONE;  // Baseline elevation (16.16)
@@ -169,13 +134,6 @@ struct TectonicNode {
         return plate_id != 0 ? plate_id : id;
     }
 
-    FORCE_INLINE Vec2Fixed velocity_at(const Vec2Fixed& /*p*/) const {
-        return velocity;
-    }
-
-    FORCE_INLINE int64_t tilt_elevation_at(const Vec2Fixed& /*p*/) const {
-        return 0;
-    }
 };
 
 // ===== Continuous Query Sample =====
@@ -217,8 +175,19 @@ public:
         int64_t world_width  = 512 * ONE;
         int64_t world_height = 512 * ONE;
         int32_t num_plates   = 16;
-        int32_t continent_chance_pct = 70; // 70% continental, 30% oceanic for interior plates
-        int32_t island_arc_chance_pct = 25; // % of oceanic plates that become ISLAND_ARC instead
+        int32_t continent_chance_pct = 100; // All plates continental (oceanic distinction removed)
+        int32_t island_arc_chance_pct = 0; // Deprecated: no island arc distinction
+
+        // Center Bias for Plate Velocity
+        // 16.16 fixed-point (-ONE to +ONE, i.e. -1.0 to +1.0)
+        // > 0: Plates drift inward toward world center (central mountain convergence)
+        // < 0: Plates drift outward away from world center (central rifting / spreading)
+        //   0: Isotropic random drift (default)
+        int64_t center_bias = 0;
+
+        // Plate velocity bounds (16.16)
+        int64_t velocity_min = 6000;
+        int64_t velocity_max = 24000;
 
         // Domain Warping (organic boundaries vs straight Voronoi lines)
         // Kept at ~32 to ensure continuous boundaries without caustic coordinate folding or cliff steepening
@@ -265,12 +234,22 @@ public:
         int32_t best_candidate_k_fine   = 20; // k tried per fine node (more nodes → higher k needed for coverage)
 
         // Two-pass tessellation
-        // num_fine_plates: number of fine retessellation nodes (0 = disabled: direct plate modeling)
+        // num_fine_plates: number of fine retessellation nodes.
+        //   0  = disabled: skip Pass 2 and use the coarse plates directly.
+        //  -1  = auto: generate count * 4 fine nodes (legacy behaviour).
+        //  > 0 = explicit fine node count.
         int32_t num_fine_plates        = 0;
         // border_oceanic_margin: nodes that lie within this distance of a canvas
         // edge are classified as OCEANIC so the map has an ocean rim.
         // (0 = auto: world_width / 10, in 16.16 fixed-point units)
         int64_t border_oceanic_margin  = 0;
+
+        // Continental Margin & Perimeter Sea Slope
+        // margin_fraction: fraction of canvas min dimension used as coastal slope (15% = 9830 in 16.16)
+        // All plates remain CONTINENTAL. The outer perimeter smoothly slopes below sea level (H <= 0).
+        // (0 = disabled: uniform interior continent to borders)
+        int64_t margin_fraction = 9830; // 0.15 * 65536 = 15%
+        int64_t sea_floor_elevation = -24 * ONE; // -24m deep ocean floor at canvas border
 
         // Baseline elevation blend range: how far from a plate boundary the elevation smoothly
         // interpolates from the midpoint value to the interior value. Expressed as a fraction of
@@ -400,7 +379,106 @@ private:
         }
     };
 
+    // ---------------------------------------------------------------
+    // EdgeGrid: Spatial acceleration for macro plate edge queries.
+    // Each edge is registered in every grid cell whose bounding box
+    // overlaps the edge's AABB (plus one-cell margin). At query time
+    // only the local cell and its 8 neighbours are scanned, reducing
+    // the O(E) linear scan to near O(1).
+    // ---------------------------------------------------------------
+    struct EdgeGrid {
+        int32_t cols = 0;
+        int32_t rows = 0;
+        int64_t cell_w = ONE;
+        int64_t cell_h = ONE;
+        std::vector<std::vector<int32_t>> cells; // edge indices per cell
+
+        void build(const std::vector<MacroPlateEdge>& edges,
+                   int64_t world_w, int64_t world_h,
+                   int32_t target_cols, int32_t target_rows) {
+            cols = std::max(4, target_cols);
+            rows = std::max(4, target_rows);
+            cell_w = world_w / cols;
+            cell_h = world_h / rows;
+            if (cell_w <= 0) cell_w = ONE;
+            if (cell_h <= 0) cell_h = ONE;
+
+            cells.assign(static_cast<size_t>(cols) * rows, {});
+
+            for (int32_t ei = 0; ei < (int32_t)edges.size(); ++ei) {
+                const auto& e = edges[ei];
+                // AABB of the edge segment
+                int64_t min_x = std::min(e.v0.x, e.v1.x);
+                int64_t max_x = std::max(e.v0.x, e.v1.x);
+                int64_t min_y = std::min(e.v0.y, e.v1.y);
+                int64_t max_y = std::max(e.v0.y, e.v1.y);
+
+                // Map to cell range, clamped to grid, +1 cell margin on each side
+                int32_t cx0 = static_cast<int32_t>(std::max(0LL, min_x / cell_w - 1));
+                int32_t cx1 = static_cast<int32_t>(std::min((int64_t)(cols - 1), max_x / cell_w + 1));
+                int32_t cy0 = static_cast<int32_t>(std::max(0LL, min_y / cell_h - 1));
+                int32_t cy1 = static_cast<int32_t>(std::min((int64_t)(rows - 1), max_y / cell_h + 1));
+
+                for (int32_t cy = cy0; cy <= cy1; ++cy)
+                    for (int32_t cx = cx0; cx <= cx1; ++cx)
+                        cells[static_cast<size_t>(cy) * cols + cx].push_back(ei);
+            }
+        }
+
+        // Find the two closest edges to query position (wx, wy).
+        // Expands the search radius until at least 2 distinct edges are found.
+        void query_two_nearest(
+            const std::vector<MacroPlateEdge>& edges,
+            const Vec2Fixed& p,
+            int& out_best, int& out_second,
+            int64_t& out_d2_best, int64_t& out_t_best,
+            int64_t& out_d2_second, int64_t& out_t_second
+        ) const {
+            out_best   = -1; out_second  = -1;
+            out_d2_best = 0x7FFFFFFFFFFFFFFF;
+            out_d2_second = 0x7FFFFFFFFFFFFFFF;
+            out_t_best = 0; out_t_second = 0;
+
+            if (cells.empty() || edges.empty()) return;
+
+            int32_t qcx = static_cast<int32_t>(std::clamp(p.x / cell_w, 0LL, (int64_t)(cols - 1)));
+            int32_t qcy = static_cast<int32_t>(std::clamp(p.y / cell_h, 0LL, (int64_t)(rows - 1)));
+
+            for (int32_t r = 0; r <= std::max(cols, rows); ++r) {
+                // Early exit: if second-best found and the nearest possible point in the
+                // next ring is beyond current second-best distance, stop.
+                if (out_second >= 0 && r > 1) {
+                    int64_t ring_dist = static_cast<int64_t>(r - 1) * std::min(cell_w, cell_h);
+                    int64_t ring_min_d2 = mul_fixed(ring_dist, ring_dist);
+                    if (ring_min_d2 > out_d2_second) break;
+                }
+
+                int32_t x0 = std::max(0, qcx - r);
+                int32_t x1 = std::min(cols - 1, qcx + r);
+                int32_t y0 = std::max(0, qcy - r);
+                int32_t y1 = std::min(rows - 1, qcy + r);
+
+                for (int32_t cy = y0; cy <= y1; ++cy) {
+                    for (int32_t cx = x0; cx <= x1; ++cx) {
+                        if (r > 0 && cx > x0 && cx < x1 && cy > y0 && cy < y1) continue;
+                        for (int32_t ei : cells[static_cast<size_t>(cy) * cols + cx]) {
+                            int64_t t_proj = 0;
+                            int64_t d2 = dist_to_segment_fixed(p, edges[ei].v0, edges[ei].v1, t_proj);
+                            if (d2 < out_d2_best) {
+                                out_d2_second = out_d2_best; out_second = out_best; out_t_second = out_t_best;
+                                out_d2_best   = d2;          out_best   = ei;       out_t_best   = t_proj;
+                            } else if (ei != out_best && d2 < out_d2_second) {
+                                out_d2_second = d2; out_second = ei; out_t_second = t_proj;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
     SpatialGrid _grid;
+    EdgeGrid   _edge_grid;
 
 public:
     ContinuousTectonicHeightmap() = default;
@@ -522,7 +600,8 @@ public:
                     int64_t h_eff = (plates[i].crust_thickness + plates[j].crust_thickness) / 2;
                     int64_t r_eff = (plates[i].crust_rigidity + plates[j].crust_rigidity) / 2;
 
-                    e.alpha = (24 * ONE) + mul_fixed(h_eff, 16384) + mul_fixed(r_eff, 8192);
+                    int64_t base_belt = _config.fold_belt_base_width > 0 ? _config.fold_belt_base_width : (44 * ONE);
+                    e.alpha = mul_fixed(base_belt, 45875) + mul_fixed(h_eff, 16384) + mul_fixed(r_eff, 8192);
                     e.a_overrides = (plates[i].plate_type == PlateType::CONTINENTAL && plates[j].plate_type != PlateType::CONTINENTAL) ||
                                     (plates[i].crust_rigidity > plates[j].crust_rigidity) ||
                                     (plates[i].crust_rigidity == plates[j].crust_rigidity && plates[i].id <= plates[j].id);
@@ -558,11 +637,138 @@ public:
                 }
             }
         }
+
+        // Vertex Harmonization: Harmonize peak uplift AND baseline elevation across all shared vertices
+        // to guarantee C^0 / C^1 continuity across boundaries without stepped cliffs or artificial cones
+        struct VertexAcc {
+            Vec2Fixed pos;
+            std::vector<std::pair<int, int>> incident; // (edge_idx, end: 0 or 1)
+            bool touches_ocean = false;
+            bool touches_land = false;
+        };
+        std::vector<VertexAcc> vert_acc;
+        vert_acc.reserve(_macro_edges.size());
+
+        // Hash map for O(1) average vertex deduplication (replaces O(E) linear scan).
+        // Key: quantized position at 2-unit grid (right-shift by 17 bits = ~2m resolution in 16.16).
+        std::unordered_map<uint64_t, int> vert_map;
+        vert_map.reserve(_macro_edges.size() * 2);
+
+        auto find_or_add_vert = [&](const Vec2Fixed& p) -> int {
+            // Quantise to ~2m grid (bit 17 of 16.16 = 2 units)
+            int64_t qx = p.x >> 17;
+            int64_t qy = p.y >> 17;
+            // Search the 3×3 neighbourhood to handle tolerance across quantisation cells
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    uint64_t key = static_cast<uint64_t>((qx + dx) & 0xFFFFFFFF) |
+                                   (static_cast<uint64_t>((qy + dy) & 0xFFFFFFFF) << 32);
+                    auto it = vert_map.find(key);
+                    if (it != vert_map.end()) {
+                        int vi = it->second;
+                        Vec2Fixed diff = p - vert_acc[vi].pos;
+                        if (diff.length_sq() <= (2 * ONE)) {
+                            return vi;
+                        }
+                    }
+                }
+            }
+            uint64_t key = static_cast<uint64_t>(qx & 0xFFFFFFFF) |
+                           (static_cast<uint64_t>(qy & 0xFFFFFFFF) << 32);
+            int new_idx = static_cast<int>(vert_acc.size());
+            VertexAcc v;
+            v.pos = p;
+            vert_acc.push_back(v);
+            vert_map[key] = new_idx;
+            return new_idx;
+        };
+
+        for (size_t ei = 0; ei < _macro_edges.size(); ++ei) {
+            int v0_idx = find_or_add_vert(_macro_edges[ei].v0);
+            int v1_idx = find_or_add_vert(_macro_edges[ei].v1);
+            vert_acc[v0_idx].incident.push_back({static_cast<int>(ei), 0});
+            vert_acc[v1_idx].incident.push_back({static_cast<int>(ei), 1});
+
+            bool is_ocean = (_macro_edges[ei].plate_type_a == PlateType::OCEANIC ||
+                             _macro_edges[ei].plate_type_b == PlateType::OCEANIC);
+            bool is_land  = (_macro_edges[ei].plate_type_a == PlateType::CONTINENTAL ||
+                             _macro_edges[ei].plate_type_b == PlateType::CONTINENTAL ||
+                             _macro_edges[ei].plate_type_a == PlateType::ISLAND_ARC ||
+                             _macro_edges[ei].plate_type_b == PlateType::ISLAND_ARC);
+
+            if (is_ocean) {
+                vert_acc[v0_idx].touches_ocean = true;
+                vert_acc[v1_idx].touches_ocean = true;
+            }
+            if (is_land) {
+                vert_acc[v0_idx].touches_land = true;
+                vert_acc[v1_idx].touches_land = true;
+            }
+        }
+
+        int64_t beach_base = (_config.coastal_boundary_elevation > 0)
+                                 ? _config.coastal_boundary_elevation
+                                 : ((5 * ONE) / 2); // +2.5m beach berm crest
+        int64_t cont_default_base = _config.continental_base_elevation;
+        int64_t ocean_default_base = _config.oceanic_base_elevation;
+
+        std::vector<int64_t> vert_uplift(vert_acc.size(), 0);
+        std::vector<int64_t> vert_base(vert_acc.size(), 0);
+
+        for (size_t vi = 0; vi < vert_acc.size(); ++vi) {
+            const auto& v = vert_acc[vi];
+            if (v.touches_ocean && v.touches_land) {
+                // Coastal vertex: triple junction where land meets sea
+                // Uplift is 0 (plunge into water), baseline is gentle beach berm (+2.5m)
+                vert_uplift[vi] = 0;
+                vert_base[vi] = beach_base;
+            } else if (v.touches_ocean && !v.touches_land) {
+                // Purely oceanic vertex: submerged deep ocean floor
+                vert_uplift[vi] = 0;
+                vert_base[vi] = ocean_default_base;
+            } else {
+                // Pure inland continental knot: average active peak uplift and continental base
+                int64_t sum_up = 0;
+                int count_active = 0;
+                for (const auto& inc : v.incident) {
+                    int64_t up = _macro_edges[inc.first].peak_uplift;
+                    if (up > 0) {
+                        sum_up += up;
+                        count_active++;
+                    }
+                }
+                vert_uplift[vi] = count_active > 0 ? (sum_up / count_active) : 0;
+                vert_base[vi] = cont_default_base;
+            }
+        }
+
+        for (size_t vi = 0; vi < vert_acc.size(); ++vi) {
+            for (const auto& inc : vert_acc[vi].incident) {
+                if (inc.second == 0) {
+                    _macro_edges[inc.first].uplift_v0 = vert_uplift[vi];
+                    _macro_edges[inc.first].base_v0   = vert_base[vi];
+                } else {
+                    _macro_edges[inc.first].uplift_v1 = vert_uplift[vi];
+                    _macro_edges[inc.first].base_v1   = vert_base[vi];
+                }
+            }
+        }
+
+        // Rebuild the edge spatial grid after all edges are finalized.
+        {
+            int32_t grid_dim = std::max(4, (int32_t)std::sqrt((double)_macro_edges.size()) + 1);
+            _edge_grid.build(_macro_edges, _config.world_width, _config.world_height, grid_dim, grid_dim);
+        }
     }
 
     void add_node(const TectonicNode& node) {
         _nodes.push_back(node);
-        _coarse_nodes = _nodes;
+        // If nodes are being added manually (e.g. after clear_nodes() in custom setups/tests),
+        // maintain 1:1 mapping with coarse macro plates so macro edges are properly generated.
+        // When called after generate_control_nodes(), fine nodes are added without polluting coarse set.
+        if (_coarse_nodes.empty() || _coarse_nodes.size() == _nodes.size() - 1) {
+            _coarse_nodes.push_back(node);
+        }
         build_macro_edges(_coarse_nodes);
         rebuild_grid((int32_t)_nodes.size());
     }
@@ -578,18 +784,13 @@ public:
     //
     // Pass 1 – Coarse Partition:
     //   Places `num_plates` seed nodes via Mitchell's Best-Candidate sampling.
-    //   Assigns each a PlateType (CONTINENTAL / OCEANIC / ISLAND_ARC) via random roll.
-    //   Plate 0 is always CONTINENTAL (anchors the spawn-friendly region).
-    //   No border override is applied at this stage — coarse nodes are classification
-    //   prototypes only and are never pushed into _nodes.
+    //   All plates are continental (oceanic distinction removed) to ensure natural,
+    //   contiguous terrain topography without deep oceanic sinkholes.
     //
     // Pass 2 – Fine Retessellation:
     //   Generates `num_fine_plates` denser nodes using an independent RNG stream
-    //   (_seed + 99999). Each fine node inherits its PlateType from the nearest
-    //   coarse Voronoi cell (plain Euclidean, no domain warp — structural step).
-    //   After type inheritance, any fine node within `border_oceanic_margin` of a
-    //   canvas edge is reclassified as OCEANIC, so the world terminates in ocean
-    //   on all sides without requiring external guard nodes.
+    //   (_seed + 99999). Each fine node inherits its PlateType and continental
+    //   crustal properties from the nearest coarse Voronoi cell.
     //   Velocity and crustal properties are assigned using fine_rng throughout.
     //   Fine nodes are pushed into _nodes.
     //
@@ -612,15 +813,13 @@ public:
 
         int64_t border_margin = (_config.border_oceanic_margin > 0)
                                     ? _config.border_oceanic_margin
-                                    : (w / 10); // 10% outer ocean margin
+                                    : (w / 8); // 12.5% outer ocean margin
 
         // ---------------------------------------------------------------
         // PASS 1 – Macro Tectonic Plates Placement & Physics Setup
         //
-        // Mitchell's Best-Candidate Sampling for even plate distribution.
+        // Mitchell's Best-Candidate Sampling for macro plate distribution.
         // Plate 0 is placed near the world center and guaranteed CONTINENTAL.
-        // Outer border plates are classified as OCEANIC so the map is naturally
-        // encircled by ocean. Interior plates roll continental / island arc.
         // Each plate receives its own coherent drift velocity vector and crustal
         // thickness/rigidity/elevation parameters.
         // ---------------------------------------------------------------
@@ -669,85 +868,64 @@ public:
                 coarse.position = best_pos;
                 coarse_placed.push_back(best_pos);
 
-                // Plate type classification
-                if (i == 0) {
-                    coarse.plate_type = PlateType::CONTINENTAL;
-                } else {
-                    bool near_border = (
-                        best_pos.x < border_margin ||
-                        best_pos.x > (w - border_margin) ||
-                        best_pos.y < border_margin ||
-                        best_pos.y > (h - border_margin)
-                    );
-                    if (near_border) {
-                        coarse.plate_type = PlateType::OCEANIC;
-                    } else {
-                        int32_t roll = rng.next_range(0, 100);
-                        if (roll < _config.continent_chance_pct) {
-                            coarse.plate_type = PlateType::CONTINENTAL;
-                        } else {
-                            int32_t arc_roll = rng.next_range(0, 100);
-                            coarse.plate_type = (arc_roll < _config.island_arc_chance_pct)
-                                                    ? PlateType::ISLAND_ARC
-                                                    : PlateType::OCEANIC;
+                // Plate type classification: all plates are continental (oceanic distinction removed)
+                coarse.plate_type = PlateType::CONTINENTAL;
+
+                // Coherent plate drift velocity with optional center bias
+                int64_t v_min = _config.velocity_min > 0 ? _config.velocity_min : 6000;
+                int64_t v_max = _config.velocity_max > v_min ? _config.velocity_max : 24000;
+                int64_t speed = rng.next_range(v_min, v_max); // 0.09 to 0.36 units/step
+                int64_t angle = rng.next_range(-PI_FIXED, PI_FIXED);
+                Vec2Fixed rand_dir(cos_fixed(angle), sin_fixed(angle));
+
+                if (_config.center_bias != 0) {
+                    Vec2Fixed to_center = Vec2Fixed(w / 2, h / 2) - coarse.position;
+                    if (to_center.length_sq() > 0) {
+                        Vec2Fixed center_dir = to_center.normalized();
+                        int64_t b = std::clamp(_config.center_bias, -ONE, ONE);
+                        Vec2Fixed bias_dir = (b >= 0) ? center_dir : (-center_dir);
+                        int64_t abs_b = std::abs(b);
+                        Vec2Fixed blended_dir = (rand_dir * (ONE - abs_b)) + (bias_dir * abs_b);
+                        if (blended_dir.length_sq() > 0) {
+                            rand_dir = blended_dir.normalized();
                         }
                     }
                 }
 
-                // Coherent plate drift velocity
-                int64_t speed = rng.next_range(6000, 24000); // 0.09 to 0.36 units/step
-                int64_t angle = rng.next_range(-PI_FIXED, PI_FIXED);
-                coarse.velocity.x = mul_fixed(cos_fixed(angle), speed);
-                coarse.velocity.y = mul_fixed(sin_fixed(angle), speed);
+                coarse.velocity.x = mul_fixed(rand_dir.x, speed);
+                coarse.velocity.y = mul_fixed(rand_dir.y, speed);
 
-                // Crustal properties
-                switch (coarse.plate_type) {
-                    case PlateType::CONTINENTAL:
-                        coarse.base_elevation  = _config.continental_base_elevation + rng.next_range(-2 * ONE, 3 * ONE);
-                        coarse.crust_thickness = rng.next_range(30 * ONE, 52 * ONE);
-                        coarse.crust_rigidity  = rng.next_range(3 * ONE, 8 * ONE);
-                        coarse.density         = 2700 * ONE;
-                        coarse.roughness       = ONE;
-                        break;
-                    case PlateType::ISLAND_ARC:
-                        coarse.base_elevation  = _config.island_arc_base_elevation + rng.next_range(-2 * ONE, 4 * ONE);
-                        coarse.crust_thickness = rng.next_range(10 * ONE, 22 * ONE);
-                        coarse.crust_rigidity  = rng.next_range(2 * ONE, 5 * ONE);
-                        coarse.density         = 2850 * ONE;
-                        coarse.roughness       = ONE;
-                        break;
-                    case PlateType::OCEANIC:
-                    default:
-                        coarse.base_elevation  = _config.oceanic_base_elevation + rng.next_range(-8 * ONE, 6 * ONE);
-                        coarse.crust_thickness = rng.next_range(6 * ONE, 18 * ONE);
-                        coarse.crust_rigidity  = rng.next_range(1 * ONE, 4 * ONE);
-                        coarse.density         = 3000 * ONE;
-                        coarse.roughness       = ONE / 2 + rng.next_range(0, 8192);
-                        break;
-                }
+                // Crustal properties (uniform continental crust)
+                coarse.base_elevation  = _config.continental_base_elevation + rng.next_range(-2 * ONE, 3 * ONE);
+                coarse.crust_thickness = rng.next_range(30 * ONE, 52 * ONE);
+                coarse.crust_rigidity  = rng.next_range(3 * ONE, 8 * ONE);
+                coarse.density         = 2700 * ONE;
+                coarse.roughness       = ONE;
 
                 coarse_nodes.push_back(coarse);
             }
         } // end Pass 1
 
         // ---------------------------------------------------------------
-        // MACRO PLATE BOUNDARY EDGES
+        // PASS 2 – Finer Plate Retessellation with Parent Grouping
         //
-        // Generates explicit macro boundary edges via 16.16 bisector clipping.
-        // Direct edge kinematics are evaluated from pure directional push
-        // projection: c = u_a - u_b.
+        // Generates finer retessellated plates that inherit their macro parent
+        // plate's identity, velocity vector, and crustal properties.
         // ---------------------------------------------------------------
-        _coarse_nodes = coarse_nodes;
-        build_macro_edges(_coarse_nodes);
-
-        // ---------------------------------------------------------------
-        // PASS 2 – Finer Node Tessellation with Plate Grouping
-        //
-        // Generates finer nodes that inherit their parent plate's identity,
-        // bulk drift velocity, angular velocity, and crustal properties.
-        // Near the canvas border, finer nodes are reclassified as OCEANIC
-        // to ensure an organic ocean rim encircles the world.
-        // ---------------------------------------------------------------
+        // num_fine_plates = 0  → use coarse plates directly (no fine tessellation).
+        // num_fine_plates = -1 → auto: 4× the coarse plate count (legacy default).
+        // num_fine_plates > 0  → explicit fine node count.
+        if (_config.num_fine_plates == 0) {
+            // No fine pass: use coarse plates as the final tessellation.
+            for (int i = 0; i < (int)coarse_nodes.size(); ++i) {
+                _nodes.push_back(coarse_nodes[i]);
+            }
+            _coarse_nodes = coarse_nodes;
+            build_macro_edges(_coarse_nodes);
+            assert(_nodes.size() >= 2 && "ContinuousTectonicHeightmap: must have at least 2 nodes");
+            rebuild_grid((int32_t)_nodes.size());
+            return; // Early return — skip Pass 2 entirely
+        }
         int fine_count = (_config.num_fine_plates > 0) ? _config.num_fine_plates : (count * 4);
         int k_fine = _config.best_candidate_k_fine;
         SplitMix64 fine_rng(_seed + 99999);
@@ -796,15 +974,15 @@ public:
             // Inherit from nearest coarse macro plate (maintains coherent plate grouping)
             int nearest_coarse = 0;
             int64_t nearest_d2 = 0x7FFFFFFFFFFFFFFF;
-            for (int ci = 0; ci < (int)_coarse_nodes.size(); ++ci) {
-                Vec2Fixed diff = best_pos - _coarse_nodes[ci].position;
+            for (int ci = 0; ci < (int)coarse_nodes.size(); ++ci) {
+                Vec2Fixed diff = best_pos - coarse_nodes[ci].position;
                 int64_t d2 = diff.length_sq();
                 if (d2 < nearest_d2) {
                     nearest_d2 = d2;
                     nearest_coarse = ci;
                 }
             }
-            const TectonicNode& parent = _coarse_nodes[nearest_coarse];
+            const TectonicNode& parent = coarse_nodes[nearest_coarse];
             fine.plate_id         = parent.plate_id;
             fine.plate_type       = parent.plate_type;
             fine.velocity         = parent.velocity;
@@ -812,28 +990,19 @@ public:
             fine.crust_rigidity   = parent.crust_rigidity;
             fine.density          = parent.density;
             fine.roughness        = parent.roughness;
-
-            fine.base_elevation = parent.base_elevation;
-
-            // Border override: finer nodes near any canvas edge are reclassified
-            // to OCEANIC so the continent naturally transitions into a surrounding ocean
-            bool near_border = (
-                best_pos.x < border_margin ||
-                best_pos.x > (w - border_margin) ||
-                best_pos.y < border_margin ||
-                best_pos.y > (h - border_margin)
-            );
-            if (near_border) {
-                fine.plate_type      = PlateType::OCEANIC;
-                fine.base_elevation  = _config.oceanic_base_elevation + fine_rng.next_range(-6 * ONE, 4 * ONE);
-                fine.crust_thickness = fine_rng.next_range(6 * ONE, 16 * ONE);
-                fine.crust_rigidity  = fine_rng.next_range(1 * ONE, 3 * ONE);
-                fine.density         = 3000 * ONE;
-                fine.roughness       = ONE / 2 + fine_rng.next_range(0, 8192);
-            }
+            fine.base_elevation   = parent.base_elevation;
 
             _nodes.push_back(fine);
         }
+
+        // ---------------------------------------------------------------
+        // RETESSELLATED EDGES BECOME OUR NEW COARSE PLATE EDGES
+        //
+        // Retessellated plates maintain their continental plate classification
+        // (oceanic plates distinction removed).
+        // ---------------------------------------------------------------
+        _coarse_nodes = _nodes;
+        build_macro_edges(_coarse_nodes);
 
         assert(_nodes.size() >= 2 && "ContinuousTectonicHeightmap: must have at least 2 nodes");
         rebuild_grid((int32_t)_nodes.size());
@@ -872,6 +1041,47 @@ public:
         BoundaryType boundary_type = BoundaryType::PASSIVE_INTERIOR;
     };
 
+    // Evaluates smooth continental margin downwarp factor towards outer canvas boundaries.
+    // Returns 16.16 u in [0, ONE]:
+    //   u = ONE (1.0): deep in continental interior (100% full height, 0 margin subsidence)
+    //   u = 0 (0.0): at or beyond the canvas border (100% submerged deep ocean floor)
+    FORCE_INLINE int64_t calculate_margin_factor(const Vec2Fixed& p_warped) const {
+        if (_config.margin_fraction <= 0) return ONE;
+
+        int64_t w = _config.world_width;
+        int64_t h = _config.world_height;
+        int64_t min_dim = std::min(w, h);
+        int64_t margin_width = mul_fixed(min_dim, _config.margin_fraction);
+        if (margin_width <= 0) return ONE;
+
+        // Distance to canvas borders along X and Y
+        int64_t dx = std::min(p_warped.x, w - p_warped.x);
+        int64_t dy = std::min(p_warped.y, h - p_warped.y);
+
+        if (dx <= 0 || dy <= 0) return 0; // At or beyond border
+
+        int64_t dist = 0;
+        if (dx < margin_width && dy < margin_width) {
+            // Rounded corner: Euclidean distance to corner vertex
+            int64_t cx = margin_width - dx;
+            int64_t cy = margin_width - dy;
+            int64_t d2 = mul_fixed(cx, cx) + mul_fixed(cy, cy);
+            int64_t corner_dist = sqrt_fixed(d2);
+            if (corner_dist >= margin_width) {
+                dist = 0;
+            } else {
+                dist = margin_width - corner_dist;
+            }
+        } else {
+            dist = std::min(dx, dy);
+        }
+
+        if (dist >= margin_width) return ONE;
+
+        int64_t u = div_fixed(dist, margin_width);
+        return SimMath::quintic_smooth(std::clamp(u, 0LL, ONE));
+    }
+
     // --- Core Continuous Query Function ---
     // Samples the continuous heightfield, returning full tectonic diagnostic data
     TectonicSample sample(int64_t x_fixed, int64_t y_fixed) const {
@@ -895,12 +1105,17 @@ public:
                 result.primary_plate_id = n.id;
                 result.primary_type = n.plate_type;
                 result.elevation_base = n.base_elevation;
+                int64_t u_margin = calculate_margin_factor(p_warped);
+                if (u_margin < ONE) {
+                    result.elevation_base = mul_fixed(u_margin, result.elevation_base) + mul_fixed(ONE - u_margin, _config.sea_floor_elevation);
+                }
                 result.elevation_final = result.elevation_base;
             }
             return result;
         }
 
         // 2. Query Closest (E1) and Second-Closest (E2) Macro Plate Edges
+        // Accelerated via _edge_grid: O(k) rather than O(E) per sample.
         int best_edge_idx = -1;
         int second_edge_idx = -1;
         int64_t min_d2_1 = 0x7FFFFFFFFFFFFFFF;
@@ -908,24 +1123,28 @@ public:
         int64_t best_t_1 = 0;
         int64_t best_t_2 = 0;
 
-        for (size_t ei = 0; ei < _macro_edges.size(); ++ei) {
-            int64_t t_proj = 0;
-            int64_t d2 = dist_to_segment_fixed(p_warped, _macro_edges[ei].v0, _macro_edges[ei].v1, t_proj);
-            if (d2 < min_d2_1) {
-                min_d2_2 = min_d2_1;
-                second_edge_idx = best_edge_idx;
-                best_t_2 = best_t_1;
-
-                min_d2_1 = d2;
-                best_edge_idx = static_cast<int>(ei);
-                best_t_1 = t_proj;
-            } else if (d2 < min_d2_2) {
-                min_d2_2 = d2;
-                second_edge_idx = static_cast<int>(ei);
-                best_t_2 = t_proj;
+        if (!_edge_grid.cells.empty()) {
+            _edge_grid.query_two_nearest(
+                _macro_edges, p_warped,
+                best_edge_idx, second_edge_idx,
+                min_d2_1, best_t_1,
+                min_d2_2, best_t_2
+            );
+        } else {
+            // Fallback: linear scan (e.g. if build_macro_edges was not yet called)
+            for (size_t ei = 0; ei < _macro_edges.size(); ++ei) {
+                int64_t t_proj = 0;
+                int64_t d2 = dist_to_segment_fixed(p_warped, _macro_edges[ei].v0, _macro_edges[ei].v1, t_proj);
+                if (d2 < min_d2_1) {
+                    min_d2_2 = min_d2_1; second_edge_idx = best_edge_idx; best_t_2 = best_t_1;
+                    min_d2_1 = d2;       best_edge_idx   = static_cast<int>(ei); best_t_1 = t_proj;
+                } else if (d2 < min_d2_2) {
+                    min_d2_2 = d2; second_edge_idx = static_cast<int>(ei); best_t_2 = t_proj;
+                }
             }
         }
 
+        if (best_edge_idx < 0 || best_edge_idx >= static_cast<int>(_macro_edges.size())) return result;
         const auto& edge1 = _macro_edges[best_edge_idx];
         int64_t dist1 = sqrt_fixed(min_d2_1);
         int64_t strike1 = mul_fixed(best_t_1, edge1.length) - (edge1.length / 2) + edge1.strike_phase;
@@ -951,7 +1170,6 @@ public:
             _grid.query_three_nearest(_nodes, p_warped.x, p_warped.y, fine_idx, d_b, d_c, min_fine_d2, d2_b, d2_c);
         }
         const TectonicNode& fine_node = (fine_idx >= 0 && fine_idx < (int)_nodes.size()) ? _nodes[fine_idx] : local_plate;
-
         result.primary_plate_id = fine_node.id;
         result.secondary_plate_id = neighbor_plate.id;
         result.primary_type = fine_node.plate_type;
@@ -964,14 +1182,16 @@ public:
         result.boundary_type = edge1.boundary_type;
 
         int node_count = static_cast<int>(_nodes.empty() ? _coarse_nodes.size() : _nodes.size());
-        int64_t avg_cell_radius = _config.world_width / static_cast<int64_t>(std::max(1, (int32_t)std::sqrt((double)node_count)));
+        // Use integer sqrt to avoid float leakage in the hot sample() path.
+        int64_t avg_cell_radius = _config.world_width / std::max(1LL,
+            static_cast<int64_t>(sqrt_fixed(static_cast<int64_t>(node_count) * ONE) >> 16));
         int64_t blend_scale = (_config.blend_range_scale > 0) ? _config.blend_range_scale : 98304; // default 1.5
         int64_t blend_range = mul_fixed(avg_cell_radius, blend_scale);
         if (blend_range < 24 * ONE) blend_range = 24 * ONE;
 
         // 3. Compute Primary Boundary Interaction with Edge 1
         BoundaryInteraction inter1 = compute_edge_interaction(
-            local_plate, neighbor_plate, edge1, dist1, strike1, p_warped, blend_range
+            local_plate, neighbor_plate, edge1, dist1, strike1, p_warped, blend_range, best_t_1
         );
 
         int64_t base_elev = inter1.base_elevation;
@@ -1000,7 +1220,7 @@ public:
                 const TectonicNode& neighbor_plate2 = on_side_a2 ? coarse_list[pb2] : coarse_list[pa2];
 
                 BoundaryInteraction inter2 = compute_edge_interaction(
-                    local_plate2, neighbor_plate2, edge2, dist2, strike2, p_warped, blend_range
+                    local_plate2, neighbor_plate2, edge2, dist2, strike2, p_warped, blend_range, best_t_2
                 );
 
                 int64_t t = div_fixed(delta_dist, w_blend);
@@ -1014,6 +1234,19 @@ public:
                     btype = inter2.boundary_type;
                 }
             }
+        }
+
+        // 4b. Smooth Continental Margin & Perimeter Sea Slope
+        // All plates remain CONTINENTAL. If within the outer margin of the canvas,
+        // elevation smoothly downwarps into the sea floor, guaranteeing an organic
+        // coastal perimeter without oceanic plate seams or bisected mountains.
+        int64_t u_margin = calculate_margin_factor(p_warped);
+        if (u_margin < ONE) {
+            base_elev = mul_fixed(u_margin, base_elev) + mul_fixed(ONE - u_margin, _config.sea_floor_elevation);
+            // Mountains persist as coastal capes/headlands, tapering gently at the outer rim (u < 0.35)
+            int64_t uplift_taper = (u_margin < 22938) ? div_fixed(u_margin, 22938) : ONE;
+            uplift_taper = SimMath::quintic_smooth(std::clamp(uplift_taper, 0LL, ONE));
+            tectonic_delta = mul_fixed(tectonic_delta, uplift_taper);
         }
 
         result.elevation_base = base_elev;
@@ -1054,11 +1287,13 @@ public:
     void generate_grid(
         int32_t width, int32_t height, int64_t cell_size_fixed,
         std::vector<int32_t>& out_elevation,
-        std::vector<uint16_t>* out_plates = nullptr
+        std::vector<uint16_t>* out_plates = nullptr,
+        std::vector<TectonicSample>* out_samples = nullptr
     ) const {
         size_t total = static_cast<size_t>(width) * height;
         out_elevation.resize(total);
         if (out_plates) out_plates->resize(total);
+        if (out_samples) out_samples->resize(total);
 
         for (int32_t y = 0; y < height; ++y) {
             int64_t py = static_cast<int64_t>(y) * cell_size_fixed;
@@ -1073,6 +1308,8 @@ public:
                 if (out_plates)
                     (*out_plates)[idx] = static_cast<uint16_t>(
                         std::min<uint32_t>(s.primary_plate_id, 0xFFFFu));
+                if (out_samples)
+                    (*out_samples)[idx] = s;
             }
         }
     }
@@ -1102,7 +1339,11 @@ private:
         int64_t strike_coord,
         int64_t convergence_rate,
         int64_t shear_rate,
-        BoundaryType& out_type
+        BoundaryType& out_type,
+        const MacroPlateEdge* p_edge = nullptr,
+        int64_t t_proj = ONE / 2,
+        const Vec2Fixed& p_warped = {0, 0},
+        int64_t d_norm = 0
     ) const {
         int64_t deform = 0;
 
@@ -1128,75 +1369,199 @@ private:
                 bool a_is_overriding = (node_a.crust_rigidity > node_b.crust_rigidity) ||
                                        (node_a.crust_rigidity == node_b.crust_rigidity && node_a.id <= node_b.id);
 
-                int64_t peak_uplift = mul_fixed(_config.collision_uplift_scale, c_factor);
+                int64_t base_peak = p_edge ? p_edge->peak_uplift : mul_fixed(_config.collision_uplift_scale, c_factor);
+                int64_t harmonic_scale = ONE;
 
-                // Along-strike modulation: creates alternating high mountain massifs and lower passes/valleys
+                // Along-strike Harmonization: smoothly interpolate between v0 target uplift, edge peak, and v1 target uplift
+                // over the entire strike of the fault (u_trans = 50% from each endpoint to center peak)
+                if (p_edge && p_edge->length > 0) {
+                    if (t_proj <= ONE / 2) {
+                        int64_t s = div_fixed(t_proj, ONE / 2);
+                        int64_t w = SimMath::quintic_smooth(std::clamp(s, 0LL, ONE));
+                        base_peak = mul_fixed(ONE - w, p_edge->uplift_v0) + mul_fixed(w, p_edge->peak_uplift);
+                        harmonic_scale = w;
+                    } else {
+                        int64_t s = div_fixed(ONE - t_proj, ONE / 2);
+                        int64_t w = SimMath::quintic_smooth(std::clamp(s, 0LL, ONE));
+                        base_peak = mul_fixed(ONE - w, p_edge->uplift_v1) + mul_fixed(w, p_edge->peak_uplift);
+                        harmonic_scale = w;
+                    }
+                }
+
+                // Along-strike modulation: creates alternating high mountain massifs and lower passes/valleys,
+                // smoothly settling to harmonic baseline at vertices to eliminate vertex step creases
                 int64_t wave1 = cos_fixed(div_fixed(mul_fixed(strike_coord, TWO_PI), 56 * ONE));
                 int64_t wave2 = sin_fixed(div_fixed(mul_fixed(strike_coord, TWO_PI), 20 * ONE));
-                int64_t strike_mod = (90 * ONE / 100) + (wave1 * 30 / 100) + (wave2 * 15 / 100);
+                int64_t strike_waves = (wave1 * 30 / 100) + (wave2 * 15 / 100);
+                int64_t strike_mod = (90 * ONE / 100) + mul_fixed(strike_waves, harmonic_scale);
                 if (strike_mod < (40 * ONE / 100)) strike_mod = 40 * ONE / 100;
-                peak_uplift = mul_fixed(peak_uplift, strike_mod);
+                int64_t peak_uplift = mul_fixed(base_peak, strike_mod);
 
-                // Characteristic elastic flexural parameter: alpha = (24m + h_eff/4 + r_eff/8)
-                int64_t alpha = (24 * ONE) + mul_fixed(h_eff, 16384) + mul_fixed(r_eff, 8192);
+                // Characteristic elastic flexural parameter: scaled with fold belt width + crustal thickness/rigidity
+                int64_t base_belt = _config.fold_belt_base_width > 0 ? _config.fold_belt_base_width : (44 * ONE);
+                int64_t alpha = mul_fixed(base_belt, 45875) + mul_fixed(h_eff, 16384) + mul_fixed(r_eff, 8192);
+
+                int64_t d_eval = dist_to_boundary;
+                int64_t long_fade = ONE;
+                if (p_edge && p_edge->length > 0) {
+                    Vec2Fixed diff_v = p_warped - p_edge->v0;
+                    int64_t d_perp = abs_fixed(diff_v.dot(p_edge->normal));
+                    int64_t d_along = diff_v.dot(p_edge->tangent);
+                    int64_t fade_alpha = alpha * 2; // Broadened longitudinal decay past vertices
+                    if (d_along < 0) {
+                        d_eval = d_perp;
+                        long_fade = exp_neg_fixed(div_fixed(-d_along, fade_alpha));
+                    } else if (d_along > p_edge->length) {
+                        d_eval = d_perp;
+                        long_fade = exp_neg_fixed(div_fixed(d_along - p_edge->length, fade_alpha));
+                    }
+                }
 
                 // Analytical thin elastic plate flexural slab deflection: w(x) = w_0 * e^(-x/alpha) * cos(x/alpha)
-                int64_t slab_w = flexural_slab_profile(dist_to_boundary, alpha, peak_uplift);
+                int64_t slab_w = flexural_slab_profile(d_eval, alpha, peak_uplift);
 
-                if (a_is_overriding) {
-                    // Overriding plate: flexural mountain ridge + elevated plateau tilt ramp
-                    int64_t plateau_reach = alpha * 3;
-                    int64_t plateau_ramp = 0;
-                    if (dist_to_boundary < plateau_reach) {
-                        int64_t u_plat = div_fixed(dist_to_boundary, plateau_reach);
-                        plateau_ramp = mul_fixed(peak_uplift * 38 / 100, ONE - SimMath::quintic_smooth(u_plat));
-                    }
-                    deform = std::max(slab_w, plateau_ramp);
-                } else {
-                    // Under-riding plate: frontal thrust peak at collision seam, then dips into flexural foreland basin
-                    deform = slab_w;
+                // Surrounding Uplift & Foothills Reach (much broader footprint to eliminate sharp edges)
+                int64_t foothill_reach = a_is_overriding
+                    ? mul_fixed(alpha, 262144)  // 4.0 * alpha on overriding plate
+                    : mul_fixed(alpha, 212992); // 3.25 * alpha on under-riding plate
+
+                // 1. Broad Surrounding Regional Uplift Swell (carries the mountain flanks gently outward)
+                int64_t swell_ramp = 0;
+                if (d_eval < foothill_reach) {
+                    int64_t u = div_fixed(d_eval, foothill_reach);
+                    int64_t swell_factor = ONE - SimMath::quintic_smooth(std::clamp(u, 0LL, ONE));
+                    int64_t swell_height = a_is_overriding
+                        ? mul_fixed(peak_uplift, 29491)  // 45% of peak uplift on overriding plate
+                        : mul_fixed(peak_uplift, 22938); // 35% of peak uplift on under-riding plate
+                    swell_ramp = mul_fixed(swell_height, swell_factor);
+                }
+
+                // Base orogenic envelope: smooth transition from axial peak to broad surrounding swell
+                int64_t base_orogeny = std::max(slab_w, swell_ramp);
+
+                // 2. Rolling Foothills Undulations (harmonic fold trains flanking the mountain range)
+                int64_t hills_def = 0;
+                if (d_eval < foothill_reach && peak_uplift > 0) {
+                    int64_t lambda_hills = alpha;
+                    if (lambda_hills <= 8 * ONE) lambda_hills = 8 * ONE;
+                    int64_t lambda_sub = mul_fixed(alpha, 39321); // ~0.60 * alpha
+                    if (lambda_sub <= 6 * ONE) lambda_sub = 6 * ONE;
+
+                    // Along-strike organic phase variation (prevents rigid parallel ridges)
+                    int64_t strike_phi1 = div_fixed(strike_coord, 32 * ONE);
+                    int64_t strike_phi2 = div_fixed(strike_coord, 18 * ONE);
+
+                    int64_t phase1 = div_fixed(mul_fixed(d_eval, TWO_PI), lambda_hills) + strike_phi1;
+                    int64_t phase2 = div_fixed(mul_fixed(d_eval, TWO_PI), lambda_sub) - strike_phi2;
+                    int64_t wave_val = mul_fixed(cos_fixed(phase1), 42598) + mul_fixed(sin_fixed(phase2), 22938); // 0.65 cos + 0.35 sin
+
+                    // Envelope: rises from 0 at boundary seam, peaks in the foothill belt, decays at reach
+                    int64_t lead_in = std::clamp(div_fixed(d_eval, alpha), 0LL, ONE);
+                    lead_in = SimMath::quintic_smooth(lead_in);
+
+                    int64_t lead_out = ONE - SimMath::quintic_smooth(std::clamp(div_fixed(d_eval, foothill_reach), 0LL, ONE));
+                    int64_t hill_env = mul_fixed(lead_in, lead_out);
+
+                    // Hill amplitude: up to 25% of peak uplift (~8m - 15m rolling hills)
+                    int64_t max_hill_h = mul_fixed(peak_uplift, 16384);
+                    hills_def = mul_fixed(mul_fixed(max_hill_h, hill_env), wave_val);
+                }
+
+                deform = base_orogeny + hills_def;
+                if (long_fade < ONE) {
+                    deform = mul_fixed(deform, long_fade);
                 }
             }
-            // B. Subduction (Continental vs. Oceanic, or ISLAND_ARC involved)
-            else if (node_a.plate_type != node_b.plate_type) {
+            // B. Subduction (Continental vs. Oceanic, or ISLAND_ARC vs Oceanic)
+            else if (node_a.plate_type != node_b.plate_type &&
+                     (node_a.plate_type == PlateType::OCEANIC || node_b.plate_type == PlateType::OCEANIC)) {
                 out_type = BoundaryType::CONVERGENT_SUBDUCTION;
 
-                bool a_overrides = (node_a.plate_type == PlateType::CONTINENTAL) ||
-                                   (node_a.plate_type == PlateType::ISLAND_ARC &&
-                                    node_b.plate_type == PlateType::OCEANIC);
+                bool edge_a_is_land = (p_edge && (p_edge->plate_type_a == PlateType::CONTINENTAL || p_edge->plate_type_a == PlateType::ISLAND_ARC));
+                int64_t s_land = edge_a_is_land ? -d_norm : d_norm;
 
-                int64_t alpha = (20 * ONE) + mul_fixed(h_eff, 16384);
+                int64_t base_arc = p_edge ? p_edge->peak_uplift : mul_fixed(_config.subduction_arc_scale, c_factor);
+                int64_t harmonic_scale = ONE;
 
-                if (a_overrides) {
-                    // Continental overriding plate: volcanic cordillera arc peaks at flexural offset alpha
-                    int64_t arc_dist = abs_fixed(dist_to_boundary - alpha);
-                    int64_t arc_peak = mul_fixed(_config.subduction_arc_scale, c_factor);
+                // Along-strike Harmonization: smoothly interpolate between v0 target uplift, edge arc peak, and v1 target uplift
+                // over the entire along-strike extent of the subduction zone
+                if (p_edge && p_edge->length > 0) {
+                    if (t_proj <= ONE / 2) {
+                        int64_t s = div_fixed(t_proj, ONE / 2);
+                        int64_t w = SimMath::quintic_smooth(std::clamp(s, 0LL, ONE));
+                        base_arc = mul_fixed(ONE - w, p_edge->uplift_v0) + mul_fixed(w, p_edge->peak_uplift);
+                        harmonic_scale = w;
+                    } else {
+                        int64_t s = div_fixed(ONE - t_proj, ONE / 2);
+                        int64_t w = SimMath::quintic_smooth(std::clamp(s, 0LL, ONE));
+                        base_arc = mul_fixed(ONE - w, p_edge->uplift_v1) + mul_fixed(w, p_edge->peak_uplift);
+                        harmonic_scale = w;
+                    }
+                }
 
+                int64_t alpha = (24 * ONE) + mul_fixed(h_eff, 16384);
+
+                int64_t long_fade = ONE;
+                if (p_edge && p_edge->length > 0) {
+                    Vec2Fixed diff_v = p_warped - p_edge->v0;
+                    int64_t d_along = diff_v.dot(p_edge->tangent);
+                    int64_t fade_alpha = alpha * 2; // Broadened longitudinal decay past vertices
+                    if (d_along < 0) {
+                        long_fade = exp_neg_fixed(div_fixed(-d_along, fade_alpha));
+                    } else if (d_along > p_edge->length) {
+                        long_fade = exp_neg_fixed(div_fixed(d_along - p_edge->length, fade_alpha));
+                    }
+                }
+
+                if (s_land >= 0) {
+                    // Continental overriding plate: volcanic cordillera arc peaks inland at s_land = alpha
+                    // Smoothly rises from 0 at the coastline seam to peak_arc at alpha, eliminating coastline cliffs
                     int64_t volc_wave = cos_fixed(div_fixed(mul_fixed(strike_coord, TWO_PI), 36 * ONE));
-                    int64_t volc_mod = (85 * ONE / 100) + mul_fixed(45 * ONE / 100, volc_wave);
-                    arc_peak = mul_fixed(arc_peak, volc_mod);
+                    int64_t volc_mod = (85 * ONE / 100) + mul_fixed(mul_fixed(45 * ONE / 100, volc_wave), harmonic_scale);
+                    int64_t arc_peak = mul_fixed(base_arc, volc_mod);
 
-                    deform += flexural_slab_profile(arc_dist, alpha, arc_peak);
+                    int64_t arc_def = 0;
+                    if (s_land <= alpha) {
+                        int64_t u = div_fixed(s_land, alpha);
+                        arc_def = mul_fixed(arc_peak, SimMath::quintic_smooth(u));
+                    } else {
+                        arc_def = flexural_slab_profile(s_land - alpha, alpha, arc_peak);
+                    }
+
+                    if (long_fade < ONE) {
+                        arc_def = mul_fixed(arc_def, long_fade);
+                    }
+                    deform += arc_def;
                 } else {
-                    // Subducting oceanic plate: analytical trench depression and outer rise
-                    int64_t trench_d = mul_fixed(_config.subduction_trench_scale, c_factor);
-                    deform -= flexural_slab_profile(dist_to_boundary, alpha * 2 / 3, trench_d);
+                    // Subducting oceanic plate: offshore oceanic trench depression
+                    // Smoothly reaches 0 at the coastline seam (s_land = 0), dipping down offshore
+                    int64_t d_sea = -s_land;
+                    int64_t trench_center = 16 * ONE;
+                    int64_t trench_half_w = 16 * ONE;
+                    int64_t diff_tr = abs_fixed(d_sea - trench_center);
+
+                    if (diff_tr < trench_half_w) {
+                        int64_t u = div_fixed(diff_tr, trench_half_w);
+                        int64_t tr_env = ONE - SimMath::quintic_smooth(u);
+                        int64_t trench_d = mul_fixed(_config.subduction_trench_scale, c_factor);
+                        int64_t trench_def = mul_fixed(trench_d, tr_env);
+                        if (long_fade < ONE) {
+                            trench_def = mul_fixed(trench_def, long_fade);
+                        }
+                        deform -= trench_def;
+                    }
                 }
             }
-            // C. Oceanic-Oceanic (or ISLAND_ARC vs ISLAND_ARC) Subduction
+            // C. Oceanic-Oceanic Convergence (Strictly Submarine - zero island emergence)
             else {
                 out_type = BoundaryType::CONVERGENT_ISLAND_ARC;
 
-                int64_t trench_center = std::max(12 * ONE, belt_width / 3);
-                int64_t trench_span   = trench_center;
-                int64_t trench_dist   = abs_fixed(dist_to_boundary - trench_center);
-                if (trench_dist < trench_span) {
-                    int64_t u = div_fixed(trench_dist, trench_span);
+                // Submarine oceanic trench centered along the boundary seam
+                int64_t trench_span = std::max(20 * ONE, belt_width / 2);
+                if (dist_to_boundary < trench_span) {
+                    int64_t u = div_fixed(dist_to_boundary, trench_span);
                     int64_t tr_env = ONE - SimMath::quintic_smooth(u);
-                    bool has_arc = (node_a.plate_type == PlateType::ISLAND_ARC || node_b.plate_type == PlateType::ISLAND_ARC);
-                    int64_t trench_d = has_arc
-                                        ? mul_fixed(_config.subduction_trench_scale, 32768) // 0.5x for arcs
-                                        : _config.subduction_trench_scale;
+                    int64_t trench_d = mul_fixed(_config.subduction_trench_scale, c_factor);
                     deform -= mul_fixed(trench_d, tr_env);
                 }
             }
@@ -1267,67 +1632,96 @@ private:
     int64_t evaluate_baseline_elevation(
         const TectonicNode& node_a,
         const TectonicNode& node_b,
+        const MacroPlateEdge& edge,
         int64_t dist_to_boundary,
         int64_t blend_range,
         int64_t local_base,
-        int64_t neighbor_base
+        int64_t neighbor_base,
+        int64_t t_proj,
+        int64_t d_norm
     ) const {
-        bool is_oceanic_a = (node_a.plate_type == PlateType::OCEANIC);
-        bool is_oceanic_b = (node_b.plate_type == PlateType::OCEANIC);
+        bool a_is_land = (edge.plate_type_a == PlateType::CONTINENTAL || edge.plate_type_a == PlateType::ISLAND_ARC);
+        bool b_is_land = (edge.plate_type_b == PlateType::CONTINENTAL || edge.plate_type_b == PlateType::ISLAND_ARC);
 
-        if (is_oceanic_a != is_oceanic_b) {
-            // Continental-Oceanic Boundary (Coastline)
-            // At dist_to_boundary = 0 (the coastline itself), elevation is exactly 0.0 (sea level) on BOTH sides.
-            if (!is_oceanic_a) {
-                // Land (Continental / Island Arc) side:
-                // Gentle sandy beach profile from 0.0m up to beach_h (+2.5m) over beach_w (20m),
-                // then smoothly rising inland to continental interior base elevation over blend_range.
-                int64_t beach_w = 20 * ONE; // 20m wide gentle sandy beach (10 tiles at 2m)
-                int64_t beach_h = (_config.coastal_boundary_elevation > 0)
-                                      ? _config.coastal_boundary_elevation
-                                      : ((5 * ONE) / 2); // +2.5m beach berm crest
+        if (a_is_land != b_is_land) {
+            // Continental-Oceanic Coastline
+            // Signed distance: positive into land, negative into ocean
+            int64_t s_land = a_is_land ? -d_norm : d_norm;
 
-                if (dist_to_boundary < beach_w) {
-                    int64_t u = div_fixed(dist_to_boundary, beach_w);
+            int64_t beach_w = 16 * ONE; // 16m sandy beach width
+            int64_t beach_h = (_config.coastal_boundary_elevation > 0)
+                                  ? _config.coastal_boundary_elevation
+                                  : ((5 * ONE) / 2); // +2.5m beach berm crest
+            int64_t surf_w  = 16 * ONE; // 16m shallow wading surf
+            int64_t surf_d  = -2 * ONE; // -2.0m outer surf depth
+            int64_t shelf_w = _config.shelf_width > 0 ? _config.shelf_width : (36 * ONE);
+            if (shelf_w <= surf_w) shelf_w = surf_w + 8 * ONE;
+            int64_t shelf_d = _config.shelf_depth; // default -8.0m
+
+            int64_t land_base = (node_a.plate_type != PlateType::OCEANIC) ? node_a.base_elevation : node_b.base_elevation;
+            int64_t ocean_base = (node_a.plate_type == PlateType::OCEANIC) ? node_a.base_elevation : node_b.base_elevation;
+
+            if (s_land >= 0) {
+                // Landward (Beach -> Coastal Plain -> Continental Interior)
+                if (s_land < beach_w) {
+                    int64_t u = div_fixed(s_land, beach_w);
                     return mul_fixed(beach_h, SimMath::quintic_smooth(u));
-                } else if (dist_to_boundary < blend_range) {
-                    int64_t inland_span = blend_range - beach_w;
-                    if (inland_span <= 0) inland_span = ONE;
-                    int64_t u = div_fixed(dist_to_boundary - beach_w, inland_span);
-                    int64_t t_blend = SimMath::quintic_smooth(std::clamp(u, 0LL, ONE));
-                    return beach_h + mul_fixed(t_blend, local_base - beach_h);
+                } else if (s_land < blend_range) {
+                    int64_t span = blend_range - beach_w;
+                    if (span <= 0) span = ONE;
+                    int64_t u = div_fixed(s_land - beach_w, span);
+                    int64_t t = SimMath::quintic_smooth(std::clamp(u, 0LL, ONE));
+                    return beach_h + mul_fixed(t, land_base - beach_h);
                 } else {
-                    return local_base;
+                    return land_base;
                 }
             } else {
-                // Oceanic side:
-                // Gentle wading surf from 0.0m down to -2.0m over surf_w,
-                // then sloping along the continental shelf to shelf_depth (-8m),
-                // then descending continental slope down to abyssal floor (-36m).
-                int64_t surf_w  = 20 * ONE; // 20m shallow wading surf
-                int64_t surf_d  = -2 * ONE; // -2.0m outer surf depth
-                int64_t shelf_w = _config.shelf_width > 0 ? _config.shelf_width : (36 * ONE);
-                if (shelf_w <= surf_w) shelf_w = surf_w + 8 * ONE;
-                int64_t shelf_d = _config.shelf_depth; // default -8.0m
-
-                if (dist_to_boundary < surf_w) {
-                    int64_t u = div_fixed(dist_to_boundary, surf_w);
+                // Seaward (Surf -> Continental Shelf -> Abyssal Ocean Floor)
+                int64_t d_sea = -s_land;
+                if (d_sea < surf_w) {
+                    int64_t u = div_fixed(d_sea, surf_w);
                     return mul_fixed(surf_d, SimMath::quintic_smooth(u));
-                } else if (dist_to_boundary < shelf_w) {
-                    int64_t u = div_fixed(dist_to_boundary - surf_w, shelf_w - surf_w);
-                    int64_t t_blend = SimMath::quintic_smooth(std::clamp(u, 0LL, ONE));
-                    return surf_d + mul_fixed(t_blend, shelf_d - surf_d);
-                } else if (dist_to_boundary < shelf_w * 2) {
-                    int64_t u = div_fixed(dist_to_boundary - shelf_w, shelf_w);
-                    int64_t t_blend = SimMath::quintic_smooth(std::clamp(u, 0LL, ONE));
-                    return shelf_d + mul_fixed(t_blend, local_base - shelf_d);
+                } else if (d_sea < shelf_w) {
+                    int64_t u = div_fixed(d_sea - surf_w, shelf_w - surf_w);
+                    int64_t t = SimMath::quintic_smooth(std::clamp(u, 0LL, ONE));
+                    return surf_d + mul_fixed(t, shelf_d - surf_d);
+                } else if (d_sea < shelf_w * 2) {
+                    int64_t u = div_fixed(d_sea - shelf_w, shelf_w);
+                    int64_t t = SimMath::quintic_smooth(std::clamp(u, 0LL, ONE));
+                    return shelf_d + mul_fixed(t, ocean_base - shelf_d);
                 } else {
-                    return local_base;
+                    return ocean_base;
                 }
             }
+        } else if (a_is_land && b_is_land) {
+            // Inland Continental-Continental Boundary
+            // Harmonize baseline elevation with coastal endpoints if touching ocean
+            int64_t mid_base = (local_base + neighbor_base) / 2;
+            int64_t target_mid = mid_base;
+
+            // Harmonize baseline elevation across full strike (50% from each endpoint to center)
+            if (edge.length > 0) {
+                if (t_proj <= ONE / 2) {
+                    int64_t s = div_fixed(t_proj, ONE / 2);
+                    int64_t w = SimMath::quintic_smooth(std::clamp(s, 0LL, ONE));
+                    target_mid = mul_fixed(ONE - w, edge.base_v0) + mul_fixed(w, mid_base);
+                } else {
+                    int64_t s = div_fixed(ONE - t_proj, ONE / 2);
+                    int64_t w = SimMath::quintic_smooth(std::clamp(s, 0LL, ONE));
+                    target_mid = mul_fixed(ONE - w, edge.base_v1) + mul_fixed(w, mid_base);
+                }
+            }
+
+            int64_t safe_blend = blend_range > 0 ? blend_range : ONE;
+            if (dist_to_boundary < safe_blend) {
+                int64_t u = div_fixed(dist_to_boundary, safe_blend);
+                int64_t t_blend = SimMath::quintic_smooth(std::clamp(u, 0LL, ONE));
+                return target_mid + mul_fixed(t_blend, local_base - target_mid);
+            }
+            return local_base;
         } else {
-            // Interior Boundary (Land-Land or Ocean-Ocean):
-            // Smooth midpoint transition between plates
+            // Oceanic-Oceanic Boundary (Both are Oceanic)
+            // Smooth midpoint transition between oceanic baselines
             int64_t h_boundary = (local_base + neighbor_base) / 2;
             int64_t safe_blend = blend_range > 0 ? blend_range : ONE;
             if (dist_to_boundary < safe_blend) {
@@ -1347,7 +1741,8 @@ private:
         int64_t dist_to_boundary,
         int64_t strike_coord,
         const Vec2Fixed& p_warped,
-        int64_t blend_range
+        int64_t blend_range,
+        int64_t t_proj = ONE / 2
     ) const {
         BoundaryInteraction res;
         res.dist_to_boundary = dist_to_boundary;
@@ -1359,18 +1754,22 @@ private:
         int64_t local_base = local_plate.base_elevation;
         int64_t neighbor_base = neighbor_plate.base_elevation;
 
+        Vec2Fixed diff_v = p_warped - edge.v0;
+        int64_t d_norm = diff_v.dot(edge.normal);
+
         res.base_elevation = evaluate_baseline_elevation(
-            local_plate, neighbor_plate, dist_to_boundary, blend_range, local_base, neighbor_base
+            local_plate, neighbor_plate, edge, dist_to_boundary, blend_range,
+            local_base, neighbor_base, t_proj, d_norm
         );
 
         res.tectonic_delta = calculate_tectonic_deformation(
             local_plate, neighbor_plate, dist_to_boundary, strike_coord,
-            edge.convergence_rate, edge.shear_rate, res.boundary_type
+            edge.convergence_rate, edge.shear_rate, res.boundary_type,
+            &edge, t_proj, p_warped, d_norm
         );
 
         return res;
     }
-
 
     // --- Procedural Meso & Micro Detail Noise ---
     int64_t calculate_detail_noise(
@@ -1403,15 +1802,16 @@ private:
         bool is_continental_or_arc = (node.plate_type == PlateType::CONTINENTAL ||
                                       node.plate_type == PlateType::ISLAND_ARC);
         if (is_continental_or_arc) {
-            // Uplift boost: active convergent deformation
-            int64_t uplift_boost = (tectonic_delta > 0)
-                ? std::clamp(div_fixed(tectonic_delta, 10 * ONE), 0LL, ONE)
-                : 0;
+            // Uplift boost: active high alpine convergent peaks (sparing rolling foothills from sharp ridges)
+            int64_t uplift_boost = 0;
+            if (tectonic_delta > 18 * ONE) {
+                uplift_boost = std::clamp(div_fixed(tectonic_delta - 18 * ONE, 16 * ONE), 0LL, ONE);
+            }
 
-            // Elevation fade: continental highlands and plateaus above ~20m
+            // Elevation fade: continental alpine highlands above ~24m
             int64_t elev_fade = 0;
-            if (macro_elev > 20 * ONE) {
-                elev_fade = std::clamp(div_fixed(macro_elev - 20 * ONE, 24 * ONE), 0LL, ONE);
+            if (macro_elev > 24 * ONE) {
+                elev_fade = std::clamp(div_fixed(macro_elev - 24 * ONE, 24 * ONE), 0LL, ONE);
             }
 
             // Strain fade: active shearing or deformation belts

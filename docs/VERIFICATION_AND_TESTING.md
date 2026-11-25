@@ -2,7 +2,7 @@
 
 This document covers the standalone headless testing harnesses, determinism verification pipelines, topological analyzers, and SCons build system configurations in ExoFarm.
 
-All test sources are located in the project root (`test_*.cpp`) and [`src/tests/`](file:///E:/exofarm/exofarm/src/tests). The SCons build configuration is defined in [`SConstruct`](file:///E:/exofarm/exofarm/SConstruct).
+All C++ test sources are located in [`tests/cpp/`](file:///E:/exofarm/exofarm/tests/cpp) and [`src/tests/`](file:///E:/exofarm/exofarm/src/tests), with Godot headless tests in [`tests/gd/`](file:///E:/exofarm/exofarm/tests/gd). The SCons build configuration is defined in [`SConstruct`](file:///E:/exofarm/exofarm/SConstruct).
 
 ---
 
@@ -16,20 +16,25 @@ flowchart TD
     A --> C["bin/test_hydrology (Hydraulic Graph & Loops)"]
     A --> D["bin/test_tectonics (Continuous Geodynamics)"]
     A --> E["bin/test_biomes (Whittaker Ecology)"]
-    A --> F["bin/libmecha_arpg (GDExtension Shared Library)"]
+    A --> F["bin/libexofarm (GDExtension Shared Library)"]
 ```
 
 | Executable Target | SCons Alias | Source File | Primary Purpose |
 | :--- | :---: | :--- | :--- |
-| **`test_determinism`** | `test` | [`test_determinism.cpp`](file:///E:/exofarm/exofarm/test_determinism.cpp) | Validates 500-tick lockstep bit-level replay and snapshot rollback equality |
-| **`test_hydrology`** | `hydrology` | [`test_hydrology.cpp`](file:///E:/exofarm/exofarm/test_hydrology.cpp) | Tests pump parasitism, reach starvation cascades, and river network topology |
-| **`test_tectonics`** | `tectonics` | [`test_tectonics.cpp`](file:///E:/exofarm/exofarm/test_tectonics.cpp) | Validates continuous sub-pixel sampling, orogeny, rifting, and subduction |
-| **`test_biomes`** | `biomes` | [`test_biomes.cpp`](file:///E:/exofarm/exofarm/test_biomes.cpp) | Analyzes biome area percentages and land-to-ocean ratios across seeds |
-| **`test_fixed_3d`** | - | [`src/tests/test_fixed_3d.cpp`](file:///E:/exofarm/exofarm/src/tests/test_fixed_3d.cpp) | Compares Bhaskara I sine/cosine against `math.h` doubles and tests quaternions |
+| **`test_determinism`** | `test` | [`tests/cpp/test_determinism.cpp`](file:///E:/exofarm/exofarm/tests/cpp/test_determinism.cpp) | Validates 500-tick lockstep bit-level replay and snapshot rollback equality |
+| **`test_hydrology`** | `hydrology` | [`tests/cpp/test_hydrology.cpp`](file:///E:/exofarm/exofarm/tests/cpp/test_hydrology.cpp) | Tests pump parasitism, reach starvation cascades, and river network topology |
+| **`test_tectonics`** | `tectonics` | [`tests/cpp/test_tectonics.cpp`](file:///E:/exofarm/exofarm/tests/cpp/test_tectonics.cpp) | Validates continuous sub-pixel sampling, orogeny, rifting, and subduction |
+| **`test_biomes`** | `biomes` | [`tests/cpp/test_biomes.cpp`](file:///E:/exofarm/exofarm/tests/cpp/test_biomes.cpp) | Analyzes biome area percentages and land-to-ocean ratios across seeds |
+| **`test_erosion`** | `erosion` | [`tests/cpp/test_erosion.cpp`](file:///E:/exofarm/exofarm/tests/cpp/test_erosion.cpp) | Tests priority-flood infilling, channels, talus, coastal, droplet & staged erosion |
+| **`test_opentopo`** | `opentopo` | [`tests/cpp/test_opentopo.cpp`](file:///E:/exofarm/exofarm/tests/cpp/test_opentopo.cpp) | Validates OpenTopo binary DEM ingestion, bicubic sampling, and splines |
+| **`test_estuary_waves`** | `estuary` | [`tests/cpp/test_estuary_waves.cpp`](file:///E:/exofarm/exofarm/tests/cpp/test_estuary_waves.cpp) | Tests river-to-sea estuary boundary masks and ocean plume fields |
+| **`test_terrain_manipulation`** | `terrain_test` | [`tests/cpp/test_terrain_manipulation.cpp`](file:///E:/exofarm/exofarm/tests/cpp/test_terrain_manipulation.cpp) | Validates runtime terrain edits, obstacle checks, and rollback determinism |
+| **`test_droplet_river`** | `droplet_river` | [`tests/cpp/test_droplet_river.cpp`](file:///E:/exofarm/exofarm/tests/cpp/test_droplet_river.cpp) | Tests droplet erosion determinism, sub-grid MFD spline extraction, and water fields |
+| **`test_fixed_3d`** | `fixed_3d` | [`src/tests/test_fixed_3d.cpp`](file:///E:/exofarm/exofarm/src/tests/test_fixed_3d.cpp) | Compares Bhaskara I sine/cosine against `math.h` doubles and tests quaternions |
 
 ---
 
-## 2. Lockstep Determinism Verification ([`test_determinism.cpp`](file:///E:/exofarm/exofarm/test_determinism.cpp))
+## 2. Lockstep Determinism Verification ([`test_determinism.cpp`](file:///E:/exofarm/exofarm/tests/cpp/test_determinism.cpp))
 
 Lockstep simulation requires that identical inputs applied to identical initial states produce identical outputs across all platforms and time steps.
 
@@ -97,8 +102,11 @@ The project is built using SCons with high optimization flags tailored for deter
 To compile the GDExtension shared library and all headless test executables:
 
 ```powershell
-# Compile the GDExtension shared library (bin/libmecha_arpg.dll)
+# Compile the GDExtension shared library (bin/libexofarm.*)
 scons platform=windows
+
+# Build all headless C++ test targets at once
+scons platform=windows all_tests
 
 # Run the 500-tick lockstep determinism test
 scons platform=windows test

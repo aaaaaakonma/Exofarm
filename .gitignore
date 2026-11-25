@@ -17,16 +17,31 @@ config.log
 
 # Executables & dynamic libraries (built locally)
 *.exe
+*.a
+bin/*.a
 bin/*.dll
+bin/*.dll.old
 bin/*.so
 bin/*.dylib
 bin/*.exp
 bin/*.lib
 bin/*.pdb
 
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Tool and export caches
+tools/.tile_cache/
+assets/exports/
+*.zip
+
 # Temp / backup files
 ~*
 *.tmp
 *.bak
 *.import
+test_*.txt
+*.log
 

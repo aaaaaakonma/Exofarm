@@ -86,6 +86,7 @@ enum class BotType : uint8_t {
     IOT_NODE = 3,
 };
 
+#pragma pack(push, 1)
 struct BotState {
     EntityID entity_id = 0;
     uint8_t  bot_type = 0; // 0=HUMANOID, 1=DRONE, 2=COMBINE, 3=IOT_NODE
@@ -123,6 +124,48 @@ struct BotState {
         return true;
     }
 };
+#pragma pack(pop)
+
+enum TerrainTreeFlags : uint8_t {
+    TREE_DEAD   = 0,
+    TREE_ALIVE  = 1 << 0,
+    TREE_FELLED = 1 << 1,
+};
+
+#pragma pack(push, 1)
+struct TerrainTree {
+    uint32_t id = 0;
+    int32_t  chunk_x = 0;
+    int32_t  chunk_y = 0;
+    int64_t  x = 0;          // World X (16.16)
+    int64_t  z = 0;          // World Z (16.16)
+    int64_t  elevation = 0;  // Ground elevation Y (16.16)
+    int64_t  normal_x = 0;   // Ground normal X (16.16)
+    int64_t  normal_y = ONE; // Ground normal Y (16.16)
+    int64_t  normal_z = 0;   // Ground normal Z (16.16)
+    uint8_t  species = 0;    // 0: Conifer, 1: Oak, 2: Birch, 3: Dead Snag
+    int64_t  age_growth = ONE; // 16.16 [0..ONE] (current growth / maturity)
+    int64_t  max_scale = ONE;  // 16.16 [0.75..1.25]
+    uint64_t seed = 0;
+    uint32_t last_sim_tick = 0;
+    uint8_t  flags = 1;      // 1: Alive, 2: Felled
+    int32_t  health = 100;
+    int32_t  max_health = 100;
+
+    bool is_alive() const { return (flags & 1) != 0 && health > 0; }
+    bool is_felled() const { return (flags & 2) != 0 || health <= 0 || (flags & 1) == 0; }
+
+    bool operator==(const TerrainTree& o) const {
+        return id == o.id && chunk_x == o.chunk_x && chunk_y == o.chunk_y &&
+               x == o.x && z == o.z && elevation == o.elevation &&
+               normal_x == o.normal_x && normal_y == o.normal_y && normal_z == o.normal_z &&
+               species == o.species && age_growth == o.age_growth &&
+               max_scale == o.max_scale && seed == o.seed &&
+               last_sim_tick == o.last_sim_tick && flags == o.flags &&
+               health == o.health && max_health == o.max_health;
+    }
+};
+#pragma pack(pop)
 
 enum class EntityTag : uint32_t {
     NONE       = 0,
@@ -288,6 +331,7 @@ struct BisectSnapshot {
     std::vector<int32_t>  water_table;
     std::vector<uint8_t>  aquifers;
     std::vector<uint8_t>  rivers;
+    std::vector<int32_t>  flow_targets;   // Snapshot fix: was missing, caused hydrology divergence on rollback
     std::vector<uint8_t>  lakes;
     std::vector<uint8_t>  structure_type;
     std::vector<int32_t>  water_pressure;
@@ -322,4 +366,9 @@ struct BisectSnapshot {
     int64_t               starter_pond_max = 0;
     std::vector<Hydrology::ReservoirNode> hydraulic_reservoirs;
     std::vector<Hydrology::RiverBelt>     hydraulic_river_belts;
+    std::vector<std::pair<int32_t, int64_t>> pump_extractions;
+    std::vector<TerrainTree>              terrain_trees;
+    std::vector<int32_t>                  water_depth;
+    std::vector<int32_t>                  water_surface_elev;
+    std::vector<uint8_t>                  is_ocean;
 };
